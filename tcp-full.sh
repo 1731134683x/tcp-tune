@@ -1,19 +1,22 @@
 #!/bin/bash
 # ============================================================
-# TCP 全流程脚本 v3.1 — BBRv3 内核 + TCP 深度调优 + 自定义模板 + AI 提示词
+# TCP 全流程脚本 v4.0 — BBRv3 内核 + TCP 深度调优 + 自定义模板 + AI 提示词
 # ============================================================
-#  上游: byJoey/Actions-bbr-v3 (预编译 BBRv3 内核)
+#  上游:
+#    byjoey  — byJoey/Actions-bbr-v3 (GitHub Actions 预编译)
+#    xdflight — XDflight/bbr3-debs (更频繁更新, kernel 7.0.8+)
 #  适用: Ubuntu / Debian (x86_64 / arm64)
 #
 #  三阶段:
-#   Phase 1 — 检测并安装 BBRv3 内核 (byJoey/Actions-bbr-v3)
+#   Phase 1 — 检测并安装 BBRv3 内核 (双上游可选)
 #   Phase 2 — VPS 检测 + 延迟测试 + 自动 TCP 调优
 #   Phase 3 — 输出报告 + 生成自定义调参模板
 #
 #  用法:
-#   sudo bash tcp-full.sh                 # 全自动
-#   sudo bash tcp-full.sh --skip-kernel   # 跳过内核安装，仅调优
-#   sudo bash tcp-full.sh --tag x86_64-7.0.3  # 指定内核版本
+#   sudo bash tcp-full.sh                      # 全自动 (默认 byJoey)
+#   sudo bash tcp-full.sh --source xdflight    # 使用 XDflight 上游
+#   sudo bash tcp-full.sh --skip-kernel        # 跳过内核安装，仅调优
+#   sudo bash tcp-full.sh --tag x86_64-7.0.3   # 指定内核版本
 # ============================================================
 
 # ---- 颜色 ----
@@ -28,9 +31,11 @@ step()  { echo -e "\n${CYAN}${BOLD}======== $* ========${NC}\n"; }
 ask()   { echo -e "${YELLOW}[?]${NC} $*"; }
 
 # ---- 全局变量 ----
-REPO="byJoey/Actions-bbr-v3"
-API_BASE="https://api.github.com/repos/${REPO}"
-GIT_HASH="g90210de4b779"
+SOURCE="byjoey"         # 默认上游: byjoey | xdflight
+REPO=""
+API_BASE=""
+GIT_HASH=""
+SOURCE_ARCH_TAG=""      # 用于 tag 过滤的架构标识 (byJoey=x86_64, XDflight=amd64)
 
 # 命令行参数
 SKIP_KERNEL=false
@@ -60,12 +65,24 @@ parse_args() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --skip-kernel) SKIP_KERNEL=true ;;
+            --source)
+                shift
+                if [[ -z "$1" ]]; then
+                    err "--source 需要一个值 (byjoey | xdflight)"
+                    exit 1
+                fi
+                case "$1" in
+                    byjoey|xdflight) SOURCE="$1" ;;
+                    *) err "--source 仅支持: byjoey, xdflight"; exit 1 ;;
+                esac
+                ;;
             --tag) shift; MANUAL_TAG="$1" ;;
             --help|-h)
                 echo "用法: sudo bash $0 [选项]"
-                echo "  --skip-kernel  跳过 BBRv3 内核安装，仅 TCP 调优"
-                echo "  --tag <tag>    安装指定 BBRv3 版本 (如 x86_64-7.0.3)"
-                echo "  --help         显示此帮助"
+                echo "  --source <src>  选择上游 (byjoey | xdflight)，默认 byjoey"
+                echo "  --skip-kernel   跳过 BBRv3 内核安装，仅 TCP 调优"
+                echo "  --tag <tag>     安装指定 BBRv3 版本 (如 x86_64-7.0.3)"
+                echo "  --help          显示此帮助"
                 exit 0
                 ;;
             *) err "未知选项: $1"; exit 1 ;;
@@ -111,6 +128,25 @@ detect_arch() {
     info "架构: $machine → ${ARCH_TAG} / deb ${ARCH_DEB}"
 }
 
+# 根据上游设置 REPO / 哈希 / 架构标签
+setup_source() {
+    case "$SOURCE" in
+        byjoey)
+            REPO="byJoey/Actions-bbr-v3"
+            GIT_HASH="g90210de4b779"
+            SOURCE_ARCH_TAG="$ARCH_TAG"   # x86_64 或 arm64
+            ;;
+        xdflight)
+            REPO="XDflight/bbr3-debs"
+            GIT_HASH=""
+            SOURCE_ARCH_TAG="$ARCH_DEB"   # amd64 或 arm64
+            ;;
+        *) err "未知上游: $SOURCE (支持: byjoey, xdflight)"; exit 1 ;;
+    esac
+    API_BASE="https://api.github.com/repos/${REPO}"
+    info "上游: ${REPO}"
+}
+
 # 检查当前运行的内核是否已是 BBRv3
 check_current_bbr_kernel() {
     if echo "$KERNEL_VER" | grep -qE "bbr3|joeyblog"; then
@@ -147,19 +183,37 @@ parse_deb_urls() {
 
 parse_latest_tag() {
     local json="$1"
-    if command -v jq &>/dev/null; then
-        echo "$json" | jq -r ".[]?.tag_name // empty | select(startswith(\"${ARCH_TAG}-\"))" 2>/dev/null | sort -V | tail -1 || true
+    if [[ "$SOURCE" == "xdflight" ]]; then
+        if command -v jq &>/dev/null; then
+            echo "$json" | jq -r ".[]?.tag_name // empty | select(startswith(\"linux-\") and contains(\"-bbr3-${SOURCE_ARCH_TAG}\"))" 2>/dev/null | sort -V | tail -1 || true
+        else
+            echo "$json" | grep -oP '"tag_name":\s*"\Klinux-[^-]+-bbr3-'"${SOURCE_ARCH_TAG}"'[^"]*' | sort -V | tail -1 || true
+        fi
     else
-        echo "$json" | grep -oP '"tag_name":\s*"\K'"${ARCH_TAG}"'-[^"]+' | sort -V | tail -1 || true
+        if command -v jq &>/dev/null; then
+            echo "$json" | jq -r ".[]?.tag_name // empty | select(startswith(\"${SOURCE_ARCH_TAG}-\"))" 2>/dev/null | sort -V | tail -1 || true
+        else
+            echo "$json" | grep -oP '"tag_name":\s*"\K'"${SOURCE_ARCH_TAG}"'-[^"]+' | sort -V | tail -1 || true
+        fi
     fi
 }
 
 build_fallback_urls() {
-    local tag="$1"; local ver="${tag#*-}"
+    local tag="$1"
     local base="https://github.com/${REPO}/releases/download/${tag}"
-    echo "${base}/linux-headers-${ver}-joeyblog-bbrv3_${ver}-${GIT_HASH}-1_${ARCH_DEB}.deb"
-    echo "${base}/linux-image-${ver}-joeyblog-bbrv3_${ver}-${GIT_HASH}-1_${ARCH_DEB}.deb"
-    echo "${base}/linux-libc-dev_${ver}-${GIT_HASH}-1_${ARCH_DEB}.deb"
+
+    if [[ "$SOURCE" == "xdflight" ]]; then
+        local ver
+        ver=$(echo "$tag" | sed -E 's/^linux-([0-9.]+)-bbr3-.*/\1/')
+        echo "${base}/linux-headers-${ver}-bbr3_${ver}-bbr3_${ARCH_DEB}.deb"
+        echo "${base}/linux-image-${ver}-bbr3_${ver}-bbr3_${ARCH_DEB}.deb"
+        echo "${base}/linux-libc-dev_${ver}-bbr3_${ARCH_DEB}.deb"
+    else
+        local ver="${tag#*-}"
+        echo "${base}/linux-headers-${ver}-joeyblog-bbrv3_${ver}-${GIT_HASH}-1_${ARCH_DEB}.deb"
+        echo "${base}/linux-image-${ver}-joeyblog-bbrv3_${ver}-${GIT_HASH}-1_${ARCH_DEB}.deb"
+        echo "${base}/linux-libc-dev_${ver}-${GIT_HASH}-1_${ARCH_DEB}.deb"
+    fi
 }
 
 fetch_release() {
@@ -179,13 +233,13 @@ fetch_release() {
         return 0
     fi
 
-    info "查询 ${REPO} 最新 ${ARCH_TAG} release ..."
+    info "查询 ${REPO} 最新 ${SOURCE_ARCH_TAG} release ..."
     local list
     list=$(curl -4fsSL --connect-timeout 10 --max-time 30 "${API_BASE}/releases?per_page=50" 2>/dev/null || true)
     if [[ -z "$list" ]]; then return 1; fi
 
     LATEST_TAG=$(parse_latest_tag "$list")
-    if [[ -z "$LATEST_TAG" ]]; then err "未找到 ${ARCH_TAG} release。"; return 1; fi
+    if [[ -z "$LATEST_TAG" ]]; then err "未找到 ${SOURCE_ARCH_TAG} release。"; return 1; fi
     info "最新 release: ${LATEST_TAG}"
 
     local detail
@@ -198,10 +252,19 @@ fetch_release() {
 
 fallback_download() {
     local tag="${1:-}"
-    [[ -z "$tag" ]] && case "$ARCH_TAG" in
-        x86_64) tag="x86_64-7.0.5" ;;
-        arm64)  tag="arm64-7.0.3"  ;;
-    esac
+    if [[ -z "$tag" ]]; then
+        if [[ "$SOURCE" == "xdflight" ]]; then
+            case "$ARCH_DEB" in
+                amd64) tag="linux-7.0.8-bbr3-amd64" ;;
+                arm64) tag="linux-7.0.8-bbr3-arm64" ;;
+            esac
+        else
+            case "$ARCH_TAG" in
+                x86_64) tag="x86_64-7.0.5" ;;
+                arm64)  tag="arm64-7.0.3"  ;;
+            esac
+        fi
+    fi
     LATEST_TAG="$tag"
     warn "API 不可达，按已知命名规律构造下载 URL (${LATEST_TAG}) ..."
     DEB_URLS=$(build_fallback_urls "$LATEST_TAG")
@@ -280,7 +343,7 @@ phase1_install_kernel() {
     fi
 
     echo ""
-    ask "是否安装 BBRv3 内核? (byJoey/Actions-bbr-v3 预编译) [Y/n]: "
+    ask "是否安装 BBRv3 内核? (${REPO} 预编译) [Y/n]: "
     read -r ans < /dev/tty
     if [[ "$ans" == "n" || "$ans" == "N" ]]; then
         info "跳过内核安装。将以当前内核进行 TCP 调优。"
@@ -288,6 +351,7 @@ phase1_install_kernel() {
     fi
 
     detect_arch
+    setup_source
 
     # 自动获取或 fallback
     if ! fetch_release "$MANUAL_TAG"; then
@@ -933,7 +997,7 @@ print_final_report() {
     echo -e "  ${BOLD}━━━ 内核状态 ━━━${NC}"
     echo -e "    当前内核:     ${CYAN}${KERNEL_VER}${NC}"
     if $KERNEL_INSTALLED; then
-        echo -e "    BBRv3:        ${GREEN}已安装 (${LATEST_TAG}) — 重启后生效${NC}"
+        echo -e "    BBRv3:        ${GREEN}已安装 (${SOURCE}/${LATEST_TAG}) — 重启后生效${NC}"
     elif $BBRV3_READY; then
         echo -e "    BBRv3:        ${GREEN}已就绪${NC}"
     else
@@ -1000,9 +1064,10 @@ main() {
     clear 2>/dev/null || true
     echo -e "${CYAN}${BOLD}"
     echo "╔══════════════════════════════════════════════════════╗"
-    echo "║   TCP 全流程调优 v3.0                                ║"
+    echo "║   TCP 全流程调优 v4.0                                ║"
     echo "║   Phase 1: BBRv3 内核  →  Phase 2: TCP 调优        ║"
     echo "║   Phase 3: 报告 + 模板 + AI 提示词                  ║"
+    echo "║   上游: byJoey / XDflight                           ║"
     echo "╚══════════════════════════════════════════════════════╝"
     echo -e "${NC}"
 

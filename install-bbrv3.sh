@@ -1,9 +1,10 @@
 #!/bin/bash
 # ============================================================
-# BBRv3 内核安装脚本 v2.0 (Ubuntu/Debian)
+# BBRv3 内核安装脚本 v3.0 (Ubuntu/Debian)
 # ============================================================
-#  上游: byJoey/Actions-bbr-v3 (GitHub Actions 预编译)
-#  来源: https://github.com/byJoey/Actions-bbr-v3
+#  上游:
+#    byjoey  — byJoey/Actions-bbr-v3 (GitHub Actions 预编译)
+#    xdflight — XDflight/bbr3-debs (更频繁更新, kernel 7.0.8+)
 #
 #  功能:
 #   1. 检测是否已安装 BBRv3 内核
@@ -12,7 +13,8 @@
 #   4. 更新 GRUB
 #
 #  用法:
-#   sudo bash install-bbrv3.sh            # 安装最新版本
+#   sudo bash install-bbrv3.sh                     # 默认 byJoey 最新版
+#   sudo bash install-bbrv3.sh --source xdflight   # 使用 XDflight 上游
 #   sudo bash install-bbrv3.sh --tag x86_64-7.0.3  # 安装指定版本
 # ============================================================
 
@@ -31,10 +33,11 @@ warn()  { echo -e "${YELLOW}[WARN]${NC} $*"; }
 err()   { echo -e "${RED}[ERROR]${NC} $*"; }
 ask()   { echo -e "${YELLOW}[?]${NC} $*"; }
 
-REPO="byJoey/Actions-bbr-v3"
-API_BASE="https://api.github.com/repos/${REPO}"
-# 已知的 git commit hash (byJoey 的编译 CI 在同一 commit 上构建了所有 release)
-GIT_HASH="g90210de4b779"
+SOURCE="byjoey"      # 默认上游: byjoey | xdflight
+REPO=""
+API_BASE=""
+GIT_HASH=""          # byJoey 的编译 CI 在同一 commit 上构建了所有 release
+SOURCE_ARCH_TAG=""   # 用于 tag 过滤的架构标识 (byJoey=x86_64, XDflight=amd64)
 MANUAL_TAG=""        # --tag 指定的版本
 ARCH_TAG=""
 ARCH_DEB=""
@@ -75,6 +78,28 @@ detect_arch() {
             ;;
     esac
     info "架构: $machine → 标签前缀 ${ARCH_TAG}, deb 后缀 ${ARCH_DEB}"
+}
+
+# ---- 根据上游设置 REPO / 哈希 / 架构标签 ----
+setup_source() {
+    case "$SOURCE" in
+        byjoey)
+            REPO="byJoey/Actions-bbr-v3"
+            GIT_HASH="g90210de4b779"
+            SOURCE_ARCH_TAG="$ARCH_TAG"   # x86_64 或 arm64
+            ;;
+        xdflight)
+            REPO="XDflight/bbr3-debs"
+            GIT_HASH=""
+            SOURCE_ARCH_TAG="$ARCH_DEB"   # amd64 或 arm64
+            ;;
+        *)
+            err "未知上游: $SOURCE (支持: byjoey, xdflight)"
+            exit 1
+            ;;
+    esac
+    API_BASE="https://api.github.com/repos/${REPO}"
+    info "上游: ${REPO}"
 }
 
 # ---- 检查当前内核 BBR 状态 ----
@@ -134,14 +159,27 @@ parse_deb_urls() {
 parse_latest_tag() {
     local json="$1"
 
-    if command -v jq &>/dev/null; then
-        echo "$json" | jq -r \
-            ".[]?.tag_name // empty | select(startswith(\"${ARCH_TAG}-\"))" \
-            2>/dev/null | sort -V | tail -1 || true
+    if [[ "$SOURCE" == "xdflight" ]]; then
+        if command -v jq &>/dev/null; then
+            echo "$json" | jq -r \
+                ".[]?.tag_name // empty | select(startswith(\"linux-\") and contains(\"-bbr3-${SOURCE_ARCH_TAG}\"))" \
+                2>/dev/null | sort -V | tail -1 || true
+        else
+            echo "$json" \
+                | grep -oP '"tag_name":\s*"\Klinux-[^-]+-bbr3-'"${SOURCE_ARCH_TAG}"'[^"]*' \
+                | sort -V | tail -1 || true
+        fi
     else
-        echo "$json" \
-            | grep -oP '"tag_name":\s*"\K'"${ARCH_TAG}"'-[^"]+' \
-            | sort -V | tail -1 || true
+        # byjoey: tag 格式 x86_64-7.0.5
+        if command -v jq &>/dev/null; then
+            echo "$json" | jq -r \
+                ".[]?.tag_name // empty | select(startswith(\"${SOURCE_ARCH_TAG}-\"))" \
+                2>/dev/null | sort -V | tail -1 || true
+        else
+            echo "$json" \
+                | grep -oP '"tag_name":\s*"\K'"${SOURCE_ARCH_TAG}"'-[^"]+' \
+                | sort -V | tail -1 || true
+        fi
     fi
 }
 
@@ -152,7 +190,7 @@ fetch_release_info() {
     if [[ -n "$tag" ]]; then
         info "获取指定 release: ${tag} ..."
     else
-        info "获取 ${REPO} 最新 ${ARCH_TAG} release ..."
+        info "获取 ${REPO} 最新 ${SOURCE_ARCH_TAG} release ..."
     fi
 
     local release_json
@@ -190,7 +228,7 @@ fetch_release_info() {
     LATEST_TAG=$(parse_latest_tag "$releases_json")
 
     if [[ -z "$LATEST_TAG" ]]; then
-        err "未找到 ${ARCH_TAG} 架构的 release。"
+        err "未找到 ${SOURCE_ARCH_TAG} 架构的 release。"
         exit 1
     fi
 
@@ -212,26 +250,26 @@ fetch_release_info() {
     fi
 }
 
-# ---- 根据 tag 直接拼 .deb 下载 URL (byJoey 的文件命名规律极稳定) ----
+# ---- 根据 tag 直接拼 .deb 下载 URL ----
 build_fallback_urls() {
     local tag="$1"
-    # tag 格式: x86_64-7.0.5  或  arm64-7.0.3
-    local ver="${tag#*-}"   # 去掉架构前缀，得到裸版本号，如 7.0.5
-
-    local urls=""
     local base="https://github.com/${REPO}/releases/download/${tag}"
+    local urls=""
 
-    # headers:  linux-headers-7.0.5-joeyblog-bbrv3_7.0.5-g90210de4b779-1_amd64.deb
-    # image:    linux-image-7.0.5-joeyblog-bbrv3_7.0.5-g90210de4b779-1_amd64.deb
-    # libc-dev: linux-libc-dev_7.0.5-g90210de4b779-1_amd64.deb  (无 joeyblog 后缀)
-
-    urls="${base}/linux-headers-${ver}-joeyblog-bbrv3_${ver}-${GIT_HASH}-1_${ARCH_DEB}.deb"$'\n'
-    urls+="${base}/linux-image-${ver}-joeyblog-bbrv3_${ver}-${GIT_HASH}-1_${ARCH_DEB}.deb"$'\n'
-    urls+="${base}/linux-libc-dev_${ver}-${GIT_HASH}-1_${ARCH_DEB}.deb"
-
-    # arm64 7.0.3 没有 dbg 包，但不排除后续版本加回来
-    # x86_64 7.0.5 有 dbg，但被我们跳过 (体积 2GB)
-    # 此处不构造 dbg URL
+    if [[ "$SOURCE" == "xdflight" ]]; then
+        # tag 格式: linux-7.0.8-bbr3-amd64
+        local ver
+        ver=$(echo "$tag" | sed -E 's/^linux-([0-9.]+)-bbr3-.*/\1/')
+        urls="${base}/linux-headers-${ver}-bbr3_${ver}-bbr3_${ARCH_DEB}.deb"$'\n'
+        urls+="${base}/linux-image-${ver}-bbr3_${ver}-bbr3_${ARCH_DEB}.deb"$'\n'
+        urls+="${base}/linux-libc-dev_${ver}-bbr3_${ARCH_DEB}.deb"
+    else
+        # byJoey: tag 格式 x86_64-7.0.5
+        local ver="${tag#*-}"   # 去掉架构前缀，得到裸版本号
+        urls="${base}/linux-headers-${ver}-joeyblog-bbrv3_${ver}-${GIT_HASH}-1_${ARCH_DEB}.deb"$'\n'
+        urls+="${base}/linux-image-${ver}-joeyblog-bbrv3_${ver}-${GIT_HASH}-1_${ARCH_DEB}.deb"$'\n'
+        urls+="${base}/linux-libc-dev_${ver}-${GIT_HASH}-1_${ARCH_DEB}.deb"
+    fi
 
     echo "$urls"
 }
@@ -244,11 +282,17 @@ fallback_download() {
     if [[ -n "$tag" ]]; then
         LATEST_TAG="$tag"
     else
-        # 使用已知的最新版本
-        case "$ARCH_TAG" in
-            x86_64) LATEST_TAG="x86_64-7.0.5" ;;
-            arm64)  LATEST_TAG="arm64-7.0.3"  ;;
-        esac
+        if [[ "$SOURCE" == "xdflight" ]]; then
+            case "$ARCH_DEB" in
+                amd64) LATEST_TAG="linux-7.0.8-bbr3-amd64" ;;
+                arm64) LATEST_TAG="linux-7.0.8-bbr3-arm64" ;;
+            esac
+        else
+            case "$ARCH_TAG" in
+                x86_64) LATEST_TAG="x86_64-7.0.5" ;;
+                arm64)  LATEST_TAG="arm64-7.0.3"  ;;
+            esac
+        fi
     fi
 
     warn "API 不可达，按已知命名规律构造下载 URL (${LATEST_TAG}) ..."
@@ -365,6 +409,7 @@ print_done() {
     echo -e "${GREEN}${BOLD}╚══════════════════════════════════════════╝${NC}"
     echo ""
     echo -e "  ${BOLD}安装版本${NC}"
+    echo -e "    上游:    ${CYAN}${SOURCE}${NC}"
     echo -e "    架构:    ${CYAN}${ARCH_TAG}${NC}"
     echo -e "    Release: ${CYAN}${LATEST_TAG:-fallback}${NC}"
     echo -e "    来源:    ${CYAN}https://github.com/${REPO}${NC}"
@@ -388,8 +433,9 @@ usage() {
     echo "用法: sudo bash $0 [选项]"
     echo ""
     echo "选项:"
-    echo "  --tag <tag>   安装指定版本 (例: --tag x86_64-7.0.3)"
-    echo "  --help        显示此帮助"
+    echo "  --source <src>  选择上游 (byjoey | xdflight)，默认 byjoey"
+    echo "  --tag <tag>     安装指定版本 (例: --tag x86_64-7.0.3)"
+    echo "  --help          显示此帮助"
     echo ""
     echo "无选项时自动安装最新版本。"
     exit 1
@@ -399,6 +445,17 @@ usage() {
 parse_args() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
+            --source)
+                shift
+                if [[ -z "$1" ]]; then
+                    err "--source 需要一个值 (byjoey | xdflight)"
+                    usage
+                fi
+                case "$1" in
+                    byjoey|xdflight) SOURCE="$1" ;;
+                    *) err "--source 仅支持: byjoey, xdflight"; exit 1 ;;
+                esac
+                ;;
             --tag)
                 shift
                 if [[ -z "$1" ]]; then
@@ -427,8 +484,8 @@ main() {
 
     echo -e "${CYAN}${BOLD}"
     echo "╔══════════════════════════════════════════╗"
-    echo "║   BBRv3 内核安装脚本 v2.0                 ║"
-    echo "║   上游: byJoey/Actions-bbr-v3            ║"
+    echo "║   BBRv3 内核安装脚本 v3.0                 ║"
+    echo "║   byJoey / XDflight 双上游              ║"
     echo "║   适用: Ubuntu / Debian (x86_64 / arm64) ║"
     echo "╚══════════════════════════════════════════╝"
     echo -e "${NC}"
@@ -436,6 +493,7 @@ main() {
     check_root
     check_os
     detect_arch
+    setup_source
     check_current_bbr
 
     # 尝试 API; 失败时走 fallback
