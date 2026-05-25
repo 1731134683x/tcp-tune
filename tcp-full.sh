@@ -13,8 +13,8 @@
 #   Phase 3 — 输出报告 + 生成自定义调参模板
 #
 #  用法:
-#   sudo bash tcp-full.sh                      # 全自动 (默认 byJoey)
-#   sudo bash tcp-full.sh --source xdflight    # 使用 XDflight 上游
+#   sudo bash tcp-full.sh                      # 交互选择上游 + 全流程
+#   sudo bash tcp-full.sh --source xdflight    # 指定 XDflight 上游
 #   sudo bash tcp-full.sh --skip-kernel        # 跳过内核安装，仅调优
 #   sudo bash tcp-full.sh --tag x86_64-7.0.3   # 指定内核版本
 # ============================================================
@@ -32,6 +32,7 @@ ask()   { echo -e "${YELLOW}[?]${NC} $*"; }
 
 # ---- 全局变量 ----
 SOURCE="byjoey"         # 默认上游: byjoey | xdflight
+SOURCE_EXPLICIT=false  # 用户是否通过 --source 显式指定
 REPO=""
 API_BASE=""
 GIT_HASH=""
@@ -72,14 +73,14 @@ parse_args() {
                     exit 1
                 fi
                 case "$1" in
-                    byjoey|xdflight) SOURCE="$1" ;;
+                    byjoey|xdflight) SOURCE="$1"; SOURCE_EXPLICIT=true ;;
                     *) err "--source 仅支持: byjoey, xdflight"; exit 1 ;;
                 esac
                 ;;
             --tag) shift; MANUAL_TAG="$1" ;;
             --help|-h)
                 echo "用法: sudo bash $0 [选项]"
-                echo "  --source <src>  选择上游 (byjoey | xdflight)，默认 byjoey"
+                echo "  --source <src>  选择上游 (byjoey | xdflight)，不指定则交互选择"
                 echo "  --skip-kernel   跳过 BBRv3 内核安装，仅 TCP 调优"
                 echo "  --tag <tag>     安装指定 BBRv3 版本 (如 x86_64-7.0.3)"
                 echo "  --help          显示此帮助"
@@ -342,6 +343,28 @@ phase1_install_kernel() {
         return
     fi
 
+    detect_arch
+
+    # 未指定 --source 时交互选择
+    if ! $SOURCE_EXPLICIT; then
+        echo ""
+        echo "  请选择 BBRv3 内核上游:"
+        echo "    1) byJoey  — byJoey/Actions-bbr-v3 (稳定, kernel 7.0.5)"
+        echo "    2) XDflight — XDflight/bbr3-debs (更新频繁, kernel 7.0.8+)"
+        echo ""
+        while true; do
+            read -r -p "  选择 [1-2] (默认 1): " src_choice < /dev/tty
+            [[ -z "$src_choice" ]] && src_choice=1
+            case "$src_choice" in
+                1) SOURCE="byjoey"; break ;;
+                2) SOURCE="xdflight"; break ;;
+                *) warn "请输入 1 或 2" ;;
+            esac
+        done
+    fi
+
+    setup_source
+
     echo ""
     ask "是否安装 BBRv3 内核? (${REPO} 预编译) [Y/n]: "
     read -r ans < /dev/tty
@@ -349,9 +372,6 @@ phase1_install_kernel() {
         info "跳过内核安装。将以当前内核进行 TCP 调优。"
         return
     fi
-
-    detect_arch
-    setup_source
 
     # 自动获取或 fallback
     if ! fetch_release "$MANUAL_TAG"; then

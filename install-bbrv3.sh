@@ -13,8 +13,8 @@
 #   4. 更新 GRUB
 #
 #  用法:
-#   sudo bash install-bbrv3.sh                     # 默认 byJoey 最新版
-#   sudo bash install-bbrv3.sh --source xdflight   # 使用 XDflight 上游
+#   sudo bash install-bbrv3.sh                     # 交互选择上游 + 安装最新版
+#   sudo bash install-bbrv3.sh --source xdflight   # 指定 XDflight 上游
 #   sudo bash install-bbrv3.sh --tag x86_64-7.0.3  # 安装指定版本
 # ============================================================
 
@@ -34,6 +34,7 @@ err()   { echo -e "${RED}[ERROR]${NC} $*"; }
 ask()   { echo -e "${YELLOW}[?]${NC} $*"; }
 
 SOURCE="byjoey"      # 默认上游: byjoey | xdflight
+SOURCE_EXPLICIT=false  # 用户是否通过 --source 显式指定
 REPO=""
 API_BASE=""
 GIT_HASH=""          # byJoey 的编译 CI 在同一 commit 上构建了所有 release
@@ -433,11 +434,11 @@ usage() {
     echo "用法: sudo bash $0 [选项]"
     echo ""
     echo "选项:"
-    echo "  --source <src>  选择上游 (byjoey | xdflight)，默认 byjoey"
+    echo "  --source <src>  选择上游 (byjoey | xdflight)，不指定则交互选择"
     echo "  --tag <tag>     安装指定版本 (例: --tag x86_64-7.0.3)"
     echo "  --help          显示此帮助"
     echo ""
-    echo "无选项时自动安装最新版本。"
+    echo "无选项时交互选择上游并安装最新版本。"
     exit 1
 }
 
@@ -452,7 +453,7 @@ parse_args() {
                     usage
                 fi
                 case "$1" in
-                    byjoey|xdflight) SOURCE="$1" ;;
+                    byjoey|xdflight) SOURCE="$1"; SOURCE_EXPLICIT=true ;;
                     *) err "--source 仅支持: byjoey, xdflight"; exit 1 ;;
                 esac
                 ;;
@@ -493,6 +494,25 @@ main() {
     check_root
     check_os
     detect_arch
+
+    # 未指定 --source 时交互选择
+    if ! $SOURCE_EXPLICIT; then
+        echo ""
+        echo "  请选择 BBRv3 内核上游:"
+        echo "    1) byJoey  — byJoey/Actions-bbr-v3 (稳定, kernel 7.0.5)"
+        echo "    2) XDflight — XDflight/bbr3-debs (更新频繁, kernel 7.0.8+)"
+        echo ""
+        while true; do
+            read -r -p "  选择 [1-2] (默认 1): " src_choice < /dev/tty
+            [[ -z "$src_choice" ]] && src_choice=1
+            case "$src_choice" in
+                1) SOURCE="byjoey"; break ;;
+                2) SOURCE="xdflight"; break ;;
+                *) warn "请输入 1 或 2" ;;
+            esac
+        done
+    fi
+
     setup_source
     check_current_bbr
 
