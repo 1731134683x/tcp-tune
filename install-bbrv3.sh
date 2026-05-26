@@ -406,6 +406,22 @@ update_bootloader() {
 enable_bbr_fq_sysctl() {
     info "写入 BBR + fq sysctl 配置..."
 
+    # 1. 扫除所有冲突: cubic + fq_codel
+    local f
+    for f in $(grep -rl "tcp_congestion_control.*=.*cubic" /etc/sysctl.d/ /usr/lib/sysctl.d/ /run/sysctl.d/ /etc/sysctl.conf 2>/dev/null || true); do
+        warn "  -> 禁用 cubic: $f"
+        sed -i "s/^net\.ipv4\.tcp_congestion_control\s*=\s*cubic/# [bbrv3] 已禁用 cubic: &/" "$f"
+    done
+    for f in $(grep -rl "default_qdisc.*=.*fq_codel" /etc/sysctl.d/ /usr/lib/sysctl.d/ /run/sysctl.d/ /etc/sysctl.conf 2>/dev/null || true); do
+        warn "  -> 禁用 fq_codel: $f"
+        sed -i "s/^net\.core\.default_qdisc\s*=\s*fq_codel/# [bbrv3] 已禁用 fq_codel: &/" "$f"
+    done
+    for f in $(grep -rl "default_qdisc.*=.*pfifo_fast" /etc/sysctl.d/ /usr/lib/sysctl.d/ /run/sysctl.d/ /etc/sysctl.conf 2>/dev/null || true); do
+        warn "  -> 禁用 pfifo_fast: $f"
+        sed -i "s/^net\.core\.default_qdisc\s*=\s*pfifo_fast/# [bbrv3] 已禁用 pfifo_fast: &/" "$f"
+    done
+
+    # 2. 写入 zzz-bbrv3.conf (字典序最后加载)
     local conf="/etc/sysctl.d/zzz-bbrv3.conf"
     cat > "$conf" <<EOF
 # BBRv3 内核基础配置 (install-bbrv3.sh 写入)
@@ -415,7 +431,7 @@ net.ipv4.tcp_congestion_control = bbr
 EOF
     ok "已写入: $conf"
 
-    # /etc/sysctl.conf 兜底 (修复 fq_codel 覆盖问题)
+    # 3. /etc/sysctl.conf 兜底 (此文件在 .d 目录之后加载)
     if grep -q "^net\.core\.default_qdisc" /etc/sysctl.conf 2>/dev/null; then
         sed -i "s/^net\.core\.default_qdisc.*/net.core.default_qdisc = fq/" /etc/sysctl.conf
     else
@@ -427,7 +443,7 @@ EOF
         echo "net.ipv4.tcp_congestion_control = bbr" >> /etc/sysctl.conf
     fi
 
-    # 立即尝试运行时生效 (如果当前内核支持)
+    # 4. 立即尝试运行时生效 (如果当前内核支持)
     sysctl -w net.core.default_qdisc=fq 2>/dev/null || true
     sysctl -w net.ipv4.tcp_congestion_control=bbr 2>/dev/null || true
 

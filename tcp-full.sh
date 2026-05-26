@@ -659,17 +659,22 @@ LIMITSEOF
     # --- 应用 ---
     info "应用配置..."
 
-    # 禁用冲突配置
+    # 禁用冲突配置: cubic / fq_codel / pfifo_fast 全部干掉
     local f
-    for f in $(grep -rl "tcp_congestion_control.*=.*cubic" /etc/sysctl.d/ /usr/lib/sysctl.d/ /etc/sysctl.conf 2>/dev/null || true); do
+    for f in $(grep -rl "tcp_congestion_control.*=.*cubic" /etc/sysctl.d/ /usr/lib/sysctl.d/ /run/sysctl.d/ /etc/sysctl.conf 2>/dev/null || true); do
         [[ "$f" == *"zzz-tcp-tune"* ]] && continue
         warn "禁用 cubic: $f"
         sed -i "s/^net\.ipv4\.tcp_congestion_control\s*=\s*cubic/# [tcp-tune] 已禁用: &/" "$f"
     done
-    for f in $(grep -rl "default_qdisc.*=.*fq_codel" /etc/sysctl.d/ /usr/lib/sysctl.d/ /etc/sysctl.conf 2>/dev/null || true); do
+    for f in $(grep -rl "default_qdisc.*=.*fq_codel" /etc/sysctl.d/ /usr/lib/sysctl.d/ /run/sysctl.d/ /etc/sysctl.conf 2>/dev/null || true); do
         [[ "$f" == *"zzz-tcp-tune"* ]] && continue
         warn "禁用 fq_codel: $f"
         sed -i "s/^net\.core\.default_qdisc\s*=\s*fq_codel/# [tcp-tune] 已禁用: &/" "$f"
+    done
+    for f in $(grep -rl "default_qdisc.*=.*pfifo_fast" /etc/sysctl.d/ /usr/lib/sysctl.d/ /run/sysctl.d/ /etc/sysctl.conf 2>/dev/null || true); do
+        [[ "$f" == *"zzz-tcp-tune"* ]] && continue
+        warn "禁用 pfifo_fast: $f"
+        sed -i "s/^net\.core\.default_qdisc\s*=\s*pfifo_fast/# [tcp-tune] 已禁用: &/" "$f"
     done
 
     sysctl --system

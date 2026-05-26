@@ -487,24 +487,22 @@ apply_config() {
     modprobe tcp_bbr 2>/dev/null || true
     modprobe sch_fq 2>/dev/null || true
 
-    # 2. 扫除冲突配置: cubic 必须去掉
-    #    fq_codel 仅在 QDISC=fq 时视为冲突 (QDISC=fq_codel 时不冲突)
-    local f cubic_files
-    cubic_files=$(grep -rl "tcp_congestion_control.*=.*cubic" /etc/sysctl.d/ /usr/lib/sysctl.d/ /etc/sysctl.conf 2>/dev/null || true)
-
-    for f in $cubic_files; do
+    # 2. 扫除冲突配置: 禁用所有非 fq 的 qdisc + 非 bbr 的拥塞控制
+    local f
+    for f in $(grep -rl "tcp_congestion_control.*=.*cubic" /etc/sysctl.d/ /usr/lib/sysctl.d/ /run/sysctl.d/ /etc/sysctl.conf 2>/dev/null || true); do
         [[ "$f" == *"zzz-tcp-tune"* ]] && continue
         warn "  -> 禁用 cubic: $f"
         sed -i "s/^net\.ipv4\.tcp_congestion_control\s*=\s*cubic/# [tcp-tune] 已禁用 cubic: &/" "$f"
     done
-
-    # 注释掉所有 fq_codel 配置 (只用 fq)
-    local fq_codel_files
-    fq_codel_files=$(grep -rl "default_qdisc.*=.*fq_codel" /etc/sysctl.d/ /usr/lib/sysctl.d/ /etc/sysctl.conf 2>/dev/null || true)
-    for f in $fq_codel_files; do
+    for f in $(grep -rl "default_qdisc.*=.*fq_codel" /etc/sysctl.d/ /usr/lib/sysctl.d/ /run/sysctl.d/ /etc/sysctl.conf 2>/dev/null || true); do
         [[ "$f" == *"zzz-tcp-tune"* ]] && continue
         warn "  -> 禁用 fq_codel: $f"
         sed -i "s/^net\.core\.default_qdisc\s*=\s*fq_codel/# [tcp-tune] 已禁用 fq_codel: &/" "$f"
+    done
+    for f in $(grep -rl "default_qdisc.*=.*pfifo_fast" /etc/sysctl.d/ /usr/lib/sysctl.d/ /run/sysctl.d/ /etc/sysctl.conf 2>/dev/null || true); do
+        [[ "$f" == *"zzz-tcp-tune"* ]] && continue
+        warn "  -> 禁用 pfifo_fast: $f"
+        sed -i "s/^net\.core\.default_qdisc\s*=\s*pfifo_fast/# [tcp-tune] 已禁用 pfifo_fast: &/" "$f"
     done
 
     # 3. 应用 sysctl
@@ -520,7 +518,7 @@ apply_config() {
     else
         echo "" >> /etc/sysctl.conf
         echo "# TCP 调优: BBR + fq" >> /etc/sysctl.conf
-        echo "net.core.default_qdisc = fq" >> /etc/sysctl.conf
+        echo "net.core.default_qdisc = ${QDISC}" >> /etc/sysctl.conf
     fi
     if grep -q "^net\.ipv4\.tcp_congestion_control" /etc/sysctl.conf 2>/dev/null; then
         sed -i "s/^net\.ipv4\.tcp_congestion_control.*/net.ipv4.tcp_congestion_control = bbr/" /etc/sysctl.conf
