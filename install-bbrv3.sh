@@ -402,6 +402,38 @@ update_bootloader() {
     ok "GRUB 已更新。"
 }
 
+# ---- 写入 BBR + fq 的 sysctl 配置 (重启后对新内核生效) ----
+enable_bbr_fq_sysctl() {
+    info "写入 BBR + fq sysctl 配置..."
+
+    local conf="/etc/sysctl.d/zzz-bbrv3.conf"
+    cat > "$conf" <<EOF
+# BBRv3 内核基础配置 (install-bbrv3.sh 写入)
+# 时间: $(date '+%Y-%m-%d %H:%M:%S')
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+EOF
+    ok "已写入: $conf"
+
+    # /etc/sysctl.conf 兜底 (修复 fq_codel 覆盖问题)
+    if grep -q "^net\.core\.default_qdisc" /etc/sysctl.conf 2>/dev/null; then
+        sed -i "s/^net\.core\.default_qdisc.*/net.core.default_qdisc = fq/" /etc/sysctl.conf
+    else
+        echo "net.core.default_qdisc = fq" >> /etc/sysctl.conf
+    fi
+    if grep -q "^net\.ipv4\.tcp_congestion_control" /etc/sysctl.conf 2>/dev/null; then
+        sed -i "s/^net\.ipv4\.tcp_congestion_control.*/net.ipv4.tcp_congestion_control = bbr/" /etc/sysctl.conf
+    else
+        echo "net.ipv4.tcp_congestion_control = bbr" >> /etc/sysctl.conf
+    fi
+
+    # 立即尝试运行时生效 (如果当前内核支持)
+    sysctl -w net.core.default_qdisc=fq 2>/dev/null || true
+    sysctl -w net.ipv4.tcp_congestion_control=bbr 2>/dev/null || true
+
+    ok "BBR + fq sysctl 配置完成。"
+}
+
 # ---- 完成提示 ----
 print_done() {
     echo ""
@@ -530,6 +562,7 @@ main() {
     download_debs
     install_debs
     update_bootloader
+    enable_bbr_fq_sysctl
     print_done
 }
 

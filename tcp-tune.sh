@@ -11,8 +11,6 @@
 #  7. 写入 /etc/sysctl.d/zzz-tcp-tune.conf 并应用
 # ============================================================
 
-set -e
-
 # ---- 颜色 ----
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -36,7 +34,7 @@ LATENCY_IPV6_MS=0
 CHOSEN_LATENCY_MS=0
 CHOSEN_IP_STACK=""
 BBRV3_READY=false
-QDISC="fq"              # 实际使用的 qdisc，检测后可能降级为 fq_codel
+QDISC="fq"              # 目标 qdisc (始终 fq，当前内核不支持则重启后生效)
 
 # ---- 输出函数 ----
 info()  { echo -e "${BLUE}[INFO]${NC} $*"; }
@@ -110,20 +108,17 @@ check_bbr() {
         BBRV3_READY=false
     fi
 
-    # 检测内核支持的最佳 qdisc: fq > fq_codel > fifo
+    # 检测内核是否支持 fq qdisc
     detect_qdisc
 }
 
 detect_qdisc() {
     if sysctl -w net.core.default_qdisc=fq 2>/dev/null; then
-        QDISC="fq"
-        ok "qdisc: fq"
+        ok "qdisc: fq (当前内核支持，已运行时生效)"
         return
     fi
-    # fq 不可用 = 内核未编译 sch_fq，不接受降级
-    QDISC="fq"
     warn "当前内核不支持 fq 队列 (sch_fq 不可用)。"
-    warn "配置文件中已写入 fq，安装/编译含 sch_fq 的内核后重启即可生效。"
+    warn "配置文件将写入 fq，安装 BBRv3 内核并重启后自动生效。"
 }
 
 # ============================================================
@@ -495,7 +490,7 @@ apply_config() {
     # 2. 扫除冲突配置: cubic 必须去掉
     #    fq_codel 仅在 QDISC=fq 时视为冲突 (QDISC=fq_codel 时不冲突)
     local f cubic_files
-    cubic_files=$(grep -rl "tcp_congestion_control.*=.*cubic" /etc/sysctl.d/ /etc/sysctl.conf 2>/dev/null || true)
+    cubic_files=$(grep -rl "tcp_congestion_control.*=.*cubic" /etc/sysctl.d/ /usr/lib/sysctl.d/ /etc/sysctl.conf 2>/dev/null || true)
 
     for f in $cubic_files; do
         [[ "$f" == *"zzz-tcp-tune"* ]] && continue
@@ -505,7 +500,7 @@ apply_config() {
 
     # 注释掉所有 fq_codel 配置 (只用 fq)
     local fq_codel_files
-    fq_codel_files=$(grep -rl "default_qdisc.*=.*fq_codel" /etc/sysctl.d/ /etc/sysctl.conf 2>/dev/null || true)
+    fq_codel_files=$(grep -rl "default_qdisc.*=.*fq_codel" /etc/sysctl.d/ /usr/lib/sysctl.d/ /etc/sysctl.conf 2>/dev/null || true)
     for f in $fq_codel_files; do
         [[ "$f" == *"zzz-tcp-tune"* ]] && continue
         warn "  -> 禁用 fq_codel: $f"
