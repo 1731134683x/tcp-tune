@@ -68,12 +68,29 @@ detect_os() {
     OS_VERSION="$VERSION_ID"
     OS_ID="$ID"
 
-    info "系统: $OS_NAME"
-    info "版本: $OS_VERSION"
+    info "系统: $OS_NAME $OS_VERSION"
+
+    # 提取主版本号 (例: 24.04 → 24)
+    local ver_major
+    ver_major=$(echo "$VERSION_ID" | cut -d. -f1)
 
     case "$OS_ID" in
-        ubuntu|debian)
-            ok "支持的系统: $OS_ID"
+        ubuntu)
+            if [[ "$ver_major" =~ ^[0-9]+$ ]] && [[ "$ver_major" -lt 24 ]]; then
+                err "Ubuntu ${VERSION_ID} 不满足最低要求 (>= 24.04)。"
+                err "BBRv3 内核需要 Ubuntu 24.04 或更高版本。"
+                exit 1
+            fi
+            ok "支持的系统: $OS_ID (满足 Ubuntu >= 24.04)"
+            ;;
+        debian)
+            # VERSION_ID 可能是数字(12)或代号(trixie/sid)或为空(testing)
+            if [[ "$ver_major" =~ ^[0-9]+$ ]] && [[ "$ver_major" -lt 12 ]]; then
+                err "Debian ${VERSION_ID} 不满足最低要求 (>= 12)。"
+                err "BBRv3 内核需要 Debian 12 或更高版本。"
+                exit 1
+            fi
+            ok "支持的系统: $OS_ID (满足 Debian >= 12)"
             ;;
         *)
             err "不支持的系统: $OS_ID。本脚本仅支持 Ubuntu 和 Debian。"
@@ -113,11 +130,14 @@ check_bbr() {
 }
 
 detect_qdisc() {
-    if sysctl -w net.core.default_qdisc=fq 2>/dev/null; then
+    sysctl -w net.core.default_qdisc=fq 2>/dev/null || true
+    local actual
+    actual=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "")
+    if [[ "$actual" == "fq" ]]; then
         ok "qdisc: fq (当前内核支持，已运行时生效)"
         return
     fi
-    warn "当前内核不支持 fq 队列 (sch_fq 不可用)。"
+    warn "当前内核不支持 fq 队列 (sch_fq 不可用，当前 qdisc: ${actual:-unknown})。"
     warn "配置文件将写入 fq，安装 BBRv3 内核并重启后自动生效。"
 }
 
@@ -471,8 +491,12 @@ LIMITSEOF
     ok "已写入模块自动加载: $modload_file"
 
     # --- Systemd 补丁 ---
-    sed -i "/^#*DefaultLimitNOFILE=/c DefaultLimitNOFILE=${nofile_limit}" /etc/systemd/system.conf 2>/dev/null || true
-    sed -i "/^#*DefaultLimitNPROC=/c DefaultLimitNPROC=${nofile_limit}" /etc/systemd/system.conf 2>/dev/null || true
+    local sed_fail=0
+    sed -i "/^#*DefaultLimitNOFILE=/c DefaultLimitNOFILE=${nofile_limit}" /etc/systemd/system.conf 2>/dev/null || sed_fail=1
+    sed -i "/^#*DefaultLimitNPROC=/c DefaultLimitNPROC=${nofile_limit}" /etc/systemd/system.conf 2>/dev/null || sed_fail=1
+    if [[ "$sed_fail" -eq 1 ]]; then
+        warn "systemd 资源限制写入失败，请手动检查 /etc/systemd/system.conf。"
+    fi
 
     ok "已更新 systemd 资源限制。"
 }
@@ -489,44 +513,74 @@ apply_config() {
 
     # 2. 扫除冲突配置: 禁用所有非 fq 的 qdisc + 非 bbr 的拥塞控制
     local f
-    for f in $(grep -rl "tcp_congestion_control.*=.*cubic" /etc/sysctl.d/ /usr/lib/sysctl.d/ /run/sysctl.d/ /etc/sysctl.conf 2>/dev/null || true); do
+    local conflict_fail=0
+    for f in $(grep -rlE "^[^#]*tcp_congestion_control\s*=\s*cubic" /etc/sysctl.d/ /usr/lib/sysctl.d/ /run/sysctl.d/ /etc/sysctl.conf 2>/dev/null || true); do
         [[ "$f" == *"zzz-tcp-tune"* ]] && continue
         warn "  -> 禁用 cubic: $f"
-        sed -i "s/^net\.ipv4\.tcp_congestion_control\s*=\s*cubic/# [tcp-tune] 已禁用 cubic: &/" "$f"
+        sed -i "s/^net\.ipv4\.tcp_congestion_control\s*=\s*cubic/# [tcp-tune] 已禁用 cubic: &/" "$f" || { err "  修改失败: $f"; conflict_fail=1; }
     done
-    for f in $(grep -rl "default_qdisc.*=.*fq_codel" /etc/sysctl.d/ /usr/lib/sysctl.d/ /run/sysctl.d/ /etc/sysctl.conf 2>/dev/null || true); do
+    for f in $(grep -rlE "^[^#]*default_qdisc\s*=\s*fq_codel" /etc/sysctl.d/ /usr/lib/sysctl.d/ /run/sysctl.d/ /etc/sysctl.conf 2>/dev/null || true); do
         [[ "$f" == *"zzz-tcp-tune"* ]] && continue
         warn "  -> 禁用 fq_codel: $f"
-        sed -i "s/^net\.core\.default_qdisc\s*=\s*fq_codel/# [tcp-tune] 已禁用 fq_codel: &/" "$f"
+        sed -i "s/^net\.core\.default_qdisc\s*=\s*fq_codel/# [tcp-tune] 已禁用 fq_codel: &/" "$f" || { err "  修改失败: $f"; conflict_fail=1; }
     done
-    for f in $(grep -rl "default_qdisc.*=.*pfifo_fast" /etc/sysctl.d/ /usr/lib/sysctl.d/ /run/sysctl.d/ /etc/sysctl.conf 2>/dev/null || true); do
+    for f in $(grep -rlE "^[^#]*default_qdisc\s*=\s*pfifo_fast" /etc/sysctl.d/ /usr/lib/sysctl.d/ /run/sysctl.d/ /etc/sysctl.conf 2>/dev/null || true); do
         [[ "$f" == *"zzz-tcp-tune"* ]] && continue
         warn "  -> 禁用 pfifo_fast: $f"
-        sed -i "s/^net\.core\.default_qdisc\s*=\s*pfifo_fast/# [tcp-tune] 已禁用 pfifo_fast: &/" "$f"
+        sed -i "s/^net\.core\.default_qdisc\s*=\s*pfifo_fast/# [tcp-tune] 已禁用 pfifo_fast: &/" "$f" || { err "  修改失败: $f"; conflict_fail=1; }
     done
+    if [[ "$conflict_fail" -eq 1 ]]; then
+        warn "部分冲突配置未能自动禁用，请手动检查上述文件。"
+    fi
 
     # 3. 应用 sysctl
-    sysctl --system
+    if sysctl --system 2>&1 | grep -qiE "error|unknown|invalid"; then
+        warn "sysctl --system 可能存在部分错误，请查看上方输出。"
+    fi
 
-    # 4. 强制运行时生效 (使用检测到的 QDISC)
+    # 4. 强制运行时生效 (使用检测到的 QDISC)，写入后立即回读验证
     sysctl -w net.core.default_qdisc="${QDISC}" 2>/dev/null || true
     sysctl -w net.ipv4.tcp_congestion_control=bbr 2>/dev/null || true
+    local qdisc_runtime cc_runtime
+    qdisc_runtime=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "")
+    cc_runtime=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "")
+    if [[ "$qdisc_runtime" != "${QDISC}" ]]; then
+        warn "运行时 qdisc 未能切换为 ${QDISC} (当前: ${qdisc_runtime:-unknown})，重启 BBRv3 内核后生效。"
+    fi
+    if [[ "$cc_runtime" != "bbr" ]]; then
+        warn "运行时 cc 未能切换为 bbr (当前: ${cc_runtime:-unknown})，重启后生效。"
+    fi
 
     # 5. 写入 /etc/sysctl.conf 兜底
+    local sed_fail=0
     if grep -q "^net\.core\.default_qdisc" /etc/sysctl.conf 2>/dev/null; then
-        sed -i "s/^net\.core\.default_qdisc.*/net.core.default_qdisc = ${QDISC}/" /etc/sysctl.conf
+        sed -i "s/^net\.core\.default_qdisc.*/net.core.default_qdisc = ${QDISC}/" /etc/sysctl.conf || sed_fail=1
     else
-        echo "" >> /etc/sysctl.conf
-        echo "# TCP 调优: BBR + fq" >> /etc/sysctl.conf
-        echo "net.core.default_qdisc = ${QDISC}" >> /etc/sysctl.conf
+        echo "" >> /etc/sysctl.conf || sed_fail=1
+        echo "# TCP 调优: BBR + fq" >> /etc/sysctl.conf || sed_fail=1
+        echo "net.core.default_qdisc = ${QDISC}" >> /etc/sysctl.conf || sed_fail=1
     fi
     if grep -q "^net\.ipv4\.tcp_congestion_control" /etc/sysctl.conf 2>/dev/null; then
-        sed -i "s/^net\.ipv4\.tcp_congestion_control.*/net.ipv4.tcp_congestion_control = bbr/" /etc/sysctl.conf
+        sed -i "s/^net\.ipv4\.tcp_congestion_control.*/net.ipv4.tcp_congestion_control = bbr/" /etc/sysctl.conf || sed_fail=1
     else
-        echo "net.ipv4.tcp_congestion_control = bbr" >> /etc/sysctl.conf
+        echo "net.ipv4.tcp_congestion_control = bbr" >> /etc/sysctl.conf || sed_fail=1
+    fi
+    if [[ "$sed_fail" -eq 1 ]]; then
+        warn "/etc/sysctl.conf 兜底写入失败，请手动检查。"
     fi
 
     systemctl daemon-reexec 2>/dev/null || true
+
+    # —— limits 生效验证 (ulimit) ——
+    local ulimit_now
+    ulimit_now=$(ulimit -n 2>/dev/null || echo "?")
+    info "当前 ulimit -n: ${ulimit_now} (期望 >= ${nofile_limit})"
+    if [[ "$ulimit_now" =~ ^[0-9]+$ && "$ulimit_now" -lt "$nofile_limit" ]]; then
+        warn "ulimit -n 未达到期望值 (当前 ${ulimit_now} < ${nofile_limit})，需重新登录或重启后生效。"
+        warn "limits.d 配置文件已写入，新 SSH session 将自动加载。"
+    elif [[ "$ulimit_now" == "$nofile_limit" || "$ulimit_now" -ge "$nofile_limit" ]]; then
+        ok "ulimit -n 已生效: ${ulimit_now}"
+    fi
 
     # 6. 最终验证
     local qdisc_final cc_final
@@ -581,6 +635,9 @@ print_summary() {
     echo -e "    BDP:       ${CYAN}$(echo "scale=2; ${bdp_bytes:-0}/1024/1024" | bc 2>/dev/null || echo '?') MB${NC}"
     echo -e "    缓冲区上限: ${CYAN}$(echo "scale=0; ${buf_max:-0}/1024/1024" | bc 2>/dev/null || echo '?') MB${NC}"
     echo -e "    文件描述符: ${CYAN}${nofile_limit:-?}${NC}"
+    local ul_show
+    ul_show=$(ulimit -n 2>/dev/null || echo "?")
+    echo -e "    ulimit -n:  ${CYAN}${ul_show}${NC}"
     echo ""
     echo -e "  ${BOLD}配置文件${NC}"
     echo -e "    sysctl:    /etc/sysctl.d/zzz-tcp-tune.conf (字典序最后加载)"
@@ -592,9 +649,12 @@ print_summary() {
     local cc_now qdisc_now
     cc_now=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "unknown")
     qdisc_now=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "unknown")
+    local ul_show
+    ul_show=$(ulimit -n 2>/dev/null || echo "?")
     echo -e "  ${BOLD}当前状态${NC}"
     echo -e "    拥塞控制:  ${GREEN}${cc_now}${NC}"
     echo -e "    队列算法:  ${GREEN}${qdisc_now}${NC}"
+    echo -e "    ulimit -n:  ${GREEN}${ul_show}${NC}"
     if [[ "$cc_now" == "bbr" && "$qdisc_now" == "${QDISC}" ]]; then
         echo -e "    ${GREEN}√ BBR + ${QDISC} 配对正确${NC}"
     else

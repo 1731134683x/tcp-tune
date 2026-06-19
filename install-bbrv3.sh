@@ -60,8 +60,29 @@ check_os() {
         exit 1
     fi
     source /etc/os-release
+
+    # 提取主版本号 (例: 24.04 → 24)
+    local ver_major
+    ver_major=$(echo "$VERSION_ID" | cut -d. -f1)
+
     case "$ID" in
-        ubuntu|debian) ok "系统: $NAME $VERSION_ID" ;;
+        ubuntu)
+            if [[ "$ver_major" =~ ^[0-9]+$ ]] && [[ "$ver_major" -lt 24 ]]; then
+                err "Ubuntu ${VERSION_ID} 不满足最低要求 (>= 24.04)。"
+                err "BBRv3 内核需要 Ubuntu 24.04 或更高版本。"
+                exit 1
+            fi
+            ok "系统: $NAME $VERSION_ID (满足 Ubuntu >= 24.04)"
+            ;;
+        debian)
+            # VERSION_ID 可能是数字(12)或代号(trixie/sid)或为空(testing)
+            if [[ "$ver_major" =~ ^[0-9]+$ ]] && [[ "$ver_major" -lt 12 ]]; then
+                err "Debian ${VERSION_ID} 不满足最低要求 (>= 12)。"
+                err "BBRv3 内核需要 Debian 12 或更高版本。"
+                exit 1
+            fi
+            ok "系统: $NAME $VERSION_ID (满足 Debian >= 12)"
+            ;;
         *) err "仅支持 Ubuntu / Debian。"  ; exit 1 ;;
     esac
 }
@@ -408,18 +429,22 @@ enable_bbr_fq_sysctl() {
 
     # 1. 扫除所有冲突: cubic + fq_codel
     local f
-    for f in $(grep -rl "tcp_congestion_control.*=.*cubic" /etc/sysctl.d/ /usr/lib/sysctl.d/ /run/sysctl.d/ /etc/sysctl.conf 2>/dev/null || true); do
+    local conflict_fail=0
+    for f in $(grep -rlE "^[^#]*tcp_congestion_control\s*=\s*cubic" /etc/sysctl.d/ /usr/lib/sysctl.d/ /run/sysctl.d/ /etc/sysctl.conf 2>/dev/null || true); do
         warn "  -> 禁用 cubic: $f"
-        sed -i "s/^net\.ipv4\.tcp_congestion_control\s*=\s*cubic/# [bbrv3] 已禁用 cubic: &/" "$f"
+        sed -i "s/^net\.ipv4\.tcp_congestion_control\s*=\s*cubic/# [bbrv3] 已禁用 cubic: &/" "$f" || { err "  修改失败: $f"; conflict_fail=1; }
     done
-    for f in $(grep -rl "default_qdisc.*=.*fq_codel" /etc/sysctl.d/ /usr/lib/sysctl.d/ /run/sysctl.d/ /etc/sysctl.conf 2>/dev/null || true); do
+    for f in $(grep -rlE "^[^#]*default_qdisc\s*=\s*fq_codel" /etc/sysctl.d/ /usr/lib/sysctl.d/ /run/sysctl.d/ /etc/sysctl.conf 2>/dev/null || true); do
         warn "  -> 禁用 fq_codel: $f"
-        sed -i "s/^net\.core\.default_qdisc\s*=\s*fq_codel/# [bbrv3] 已禁用 fq_codel: &/" "$f"
+        sed -i "s/^net\.core\.default_qdisc\s*=\s*fq_codel/# [bbrv3] 已禁用 fq_codel: &/" "$f" || { err "  修改失败: $f"; conflict_fail=1; }
     done
-    for f in $(grep -rl "default_qdisc.*=.*pfifo_fast" /etc/sysctl.d/ /usr/lib/sysctl.d/ /run/sysctl.d/ /etc/sysctl.conf 2>/dev/null || true); do
+    for f in $(grep -rlE "^[^#]*default_qdisc\s*=\s*pfifo_fast" /etc/sysctl.d/ /usr/lib/sysctl.d/ /run/sysctl.d/ /etc/sysctl.conf 2>/dev/null || true); do
         warn "  -> 禁用 pfifo_fast: $f"
-        sed -i "s/^net\.core\.default_qdisc\s*=\s*pfifo_fast/# [bbrv3] 已禁用 pfifo_fast: &/" "$f"
+        sed -i "s/^net\.core\.default_qdisc\s*=\s*pfifo_fast/# [bbrv3] 已禁用 pfifo_fast: &/" "$f" || { err "  修改失败: $f"; conflict_fail=1; }
     done
+    if [[ "$conflict_fail" -eq 1 ]]; then
+        warn "部分冲突配置未能自动禁用，请手动检查上述文件。"
+    fi
 
     # 2. 写入 zzz-bbrv3.conf (字典序最后加载)
     local conf="/etc/sysctl.d/zzz-bbrv3.conf"
@@ -432,20 +457,37 @@ EOF
     ok "已写入: $conf"
 
     # 3. /etc/sysctl.conf 兜底 (此文件在 .d 目录之后加载)
+    local sed_fail=0
     if grep -q "^net\.core\.default_qdisc" /etc/sysctl.conf 2>/dev/null; then
-        sed -i "s/^net\.core\.default_qdisc.*/net.core.default_qdisc = fq/" /etc/sysctl.conf
+        sed -i "s/^net\.core\.default_qdisc.*/net.core.default_qdisc = fq/" /etc/sysctl.conf || sed_fail=1
     else
-        echo "net.core.default_qdisc = fq" >> /etc/sysctl.conf
+        echo "net.core.default_qdisc = fq" >> /etc/sysctl.conf || sed_fail=1
     fi
     if grep -q "^net\.ipv4\.tcp_congestion_control" /etc/sysctl.conf 2>/dev/null; then
-        sed -i "s/^net\.ipv4\.tcp_congestion_control.*/net.ipv4.tcp_congestion_control = bbr/" /etc/sysctl.conf
+        sed -i "s/^net\.ipv4\.tcp_congestion_control.*/net.ipv4.tcp_congestion_control = bbr/" /etc/sysctl.conf || sed_fail=1
     else
-        echo "net.ipv4.tcp_congestion_control = bbr" >> /etc/sysctl.conf
+        echo "net.ipv4.tcp_congestion_control = bbr" >> /etc/sysctl.conf || sed_fail=1
+    fi
+    if [[ "$sed_fail" -eq 1 ]]; then
+        warn "/etc/sysctl.conf 兜底写入失败，请手动检查。"
     fi
 
-    # 4. 立即尝试运行时生效 (如果当前内核支持)
+    # 4. 立即尝试运行时生效 (如果当前内核支持)，写入后回读验证
     sysctl -w net.core.default_qdisc=fq 2>/dev/null || true
     sysctl -w net.ipv4.tcp_congestion_control=bbr 2>/dev/null || true
+    local qdisc_runtime cc_runtime
+    qdisc_runtime=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "")
+    cc_runtime=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "")
+    if [[ "$qdisc_runtime" != "fq" ]]; then
+        warn "当前内核不支持 fq (当前: ${qdisc_runtime:-unknown})，重启新内核后生效。"
+    else
+        ok "qdisc: fq 已生效。"
+    fi
+    if [[ "$cc_runtime" != "bbr" ]]; then
+        warn "当前内核不支持 bbr (当前: ${cc_runtime:-unknown})，重启新内核后生效。"
+    else
+        ok "cc: bbr 已生效。"
+    fi
 
     ok "BBR + fq sysctl 配置完成。"
 }

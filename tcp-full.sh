@@ -110,8 +110,29 @@ check_os() {
     fi
     source /etc/os-release
     OS_NAME="$NAME"; OS_VERSION="$VERSION_ID"; OS_ID="$ID"
+
+    # 提取主版本号 (例: 24.04 → 24)
+    local ver_major
+    ver_major=$(echo "$VERSION_ID" | cut -d. -f1)
+
     case "$OS_ID" in
-        ubuntu|debian) ok "系统: $OS_NAME $OS_VERSION" ;;
+        ubuntu)
+            if [[ "$ver_major" =~ ^[0-9]+$ ]] && [[ "$ver_major" -lt 24 ]]; then
+                err "Ubuntu ${VERSION_ID} 不满足最低要求 (>= 24.04)。"
+                err "BBRv3 内核需要 Ubuntu 24.04 或更高版本。"
+                exit 1
+            fi
+            ok "系统: $OS_NAME $OS_VERSION (满足 Ubuntu >= 24.04)"
+            ;;
+        debian)
+            # VERSION_ID 可能是数字(12)或代号(trixie/sid)或为空(testing)
+            if [[ "$ver_major" =~ ^[0-9]+$ ]] && [[ "$ver_major" -lt 12 ]]; then
+                err "Debian ${VERSION_ID} 不满足最低要求 (>= 12)。"
+                err "BBRv3 内核需要 Debian 12 或更高版本。"
+                exit 1
+            fi
+            ok "系统: $OS_NAME $OS_VERSION (满足 Debian >= 12)"
+            ;;
         *) err "仅支持 Ubuntu / Debian。" ; exit 1 ;;
     esac
     KERNEL_VER=$(uname -r)
@@ -653,47 +674,82 @@ LIMITSEOF
     ok "已写入: $mf"
 
     # --- systemd ---
-    sed -i "/^#*DefaultLimitNOFILE=/c DefaultLimitNOFILE=${nofile_limit}" /etc/systemd/system.conf 2>/dev/null || true
-    sed -i "/^#*DefaultLimitNPROC=/c DefaultLimitNPROC=${nofile_limit}" /etc/systemd/system.conf 2>/dev/null || true
+    local sed_fail=0
+    sed -i "/^#*DefaultLimitNOFILE=/c DefaultLimitNOFILE=${nofile_limit}" /etc/systemd/system.conf 2>/dev/null || sed_fail=1
+    sed -i "/^#*DefaultLimitNPROC=/c DefaultLimitNPROC=${nofile_limit}" /etc/systemd/system.conf 2>/dev/null || sed_fail=1
+    if [[ "$sed_fail" -eq 1 ]]; then
+        warn "systemd 资源限制写入失败，请手动检查 /etc/systemd/system.conf。"
+    fi
 
     # --- 应用 ---
     info "应用配置..."
 
     # 禁用冲突配置: cubic / fq_codel / pfifo_fast 全部干掉
     local f
-    for f in $(grep -rl "tcp_congestion_control.*=.*cubic" /etc/sysctl.d/ /usr/lib/sysctl.d/ /run/sysctl.d/ /etc/sysctl.conf 2>/dev/null || true); do
+    local conflict_fail=0
+    for f in $(grep -rlE "^[^#]*tcp_congestion_control\s*=\s*cubic" /etc/sysctl.d/ /usr/lib/sysctl.d/ /run/sysctl.d/ /etc/sysctl.conf 2>/dev/null || true); do
         [[ "$f" == *"zzz-tcp-tune"* ]] && continue
         warn "禁用 cubic: $f"
-        sed -i "s/^net\.ipv4\.tcp_congestion_control\s*=\s*cubic/# [tcp-tune] 已禁用: &/" "$f"
+        sed -i "s/^net\.ipv4\.tcp_congestion_control\s*=\s*cubic/# [tcp-tune] 已禁用: &/" "$f" || { err "  修改失败: $f"; conflict_fail=1; }
     done
-    for f in $(grep -rl "default_qdisc.*=.*fq_codel" /etc/sysctl.d/ /usr/lib/sysctl.d/ /run/sysctl.d/ /etc/sysctl.conf 2>/dev/null || true); do
+    for f in $(grep -rlE "^[^#]*default_qdisc\s*=\s*fq_codel" /etc/sysctl.d/ /usr/lib/sysctl.d/ /run/sysctl.d/ /etc/sysctl.conf 2>/dev/null || true); do
         [[ "$f" == *"zzz-tcp-tune"* ]] && continue
         warn "禁用 fq_codel: $f"
-        sed -i "s/^net\.core\.default_qdisc\s*=\s*fq_codel/# [tcp-tune] 已禁用: &/" "$f"
+        sed -i "s/^net\.core\.default_qdisc\s*=\s*fq_codel/# [tcp-tune] 已禁用: &/" "$f" || { err "  修改失败: $f"; conflict_fail=1; }
     done
-    for f in $(grep -rl "default_qdisc.*=.*pfifo_fast" /etc/sysctl.d/ /usr/lib/sysctl.d/ /run/sysctl.d/ /etc/sysctl.conf 2>/dev/null || true); do
+    for f in $(grep -rlE "^[^#]*default_qdisc\s*=\s*pfifo_fast" /etc/sysctl.d/ /usr/lib/sysctl.d/ /run/sysctl.d/ /etc/sysctl.conf 2>/dev/null || true); do
         [[ "$f" == *"zzz-tcp-tune"* ]] && continue
         warn "禁用 pfifo_fast: $f"
-        sed -i "s/^net\.core\.default_qdisc\s*=\s*pfifo_fast/# [tcp-tune] 已禁用: &/" "$f"
+        sed -i "s/^net\.core\.default_qdisc\s*=\s*pfifo_fast/# [tcp-tune] 已禁用: &/" "$f" || { err "  修改失败: $f"; conflict_fail=1; }
     done
+    if [[ "$conflict_fail" -eq 1 ]]; then
+        warn "部分冲突配置未能自动禁用，请手动检查上述文件。"
+    fi
 
-    sysctl --system
+    if sysctl --system 2>&1 | grep -qiE "error|unknown|invalid"; then
+        warn "sysctl --system 可能存在部分错误，请查看上方输出。"
+    fi
     sysctl -w net.core.default_qdisc=fq 2>/dev/null || true
     sysctl -w net.ipv4.tcp_congestion_control=bbr 2>/dev/null || true
+    # 写入后立即回读验证
+    local qdisc_runtime cc_runtime
+    qdisc_runtime=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "")
+    cc_runtime=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "")
+    if [[ "$qdisc_runtime" != "fq" ]]; then
+        warn "运行时 qdisc 未能切换为 fq (当前: ${qdisc_runtime:-unknown})，重启 BBRv3 内核后生效。"
+    fi
+    if [[ "$cc_runtime" != "bbr" ]]; then
+        warn "运行时 cc 未能切换为 bbr (当前: ${cc_runtime:-unknown})，重启后生效。"
+    fi
 
     # /etc/sysctl.conf 兜底
+    local sed_fail2=0
     if grep -q "^net\.core\.default_qdisc" /etc/sysctl.conf 2>/dev/null; then
-        sed -i "s/^net\.core\.default_qdisc.*/net.core.default_qdisc = fq/" /etc/sysctl.conf
+        sed -i "s/^net\.core\.default_qdisc.*/net.core.default_qdisc = fq/" /etc/sysctl.conf || sed_fail2=1
     else
-        echo "net.core.default_qdisc = fq" >> /etc/sysctl.conf
+        echo "net.core.default_qdisc = fq" >> /etc/sysctl.conf || sed_fail2=1
     fi
     if grep -q "^net\.ipv4\.tcp_congestion_control" /etc/sysctl.conf 2>/dev/null; then
-        sed -i "s/^net\.ipv4\.tcp_congestion_control.*/net.ipv4.tcp_congestion_control = bbr/" /etc/sysctl.conf
+        sed -i "s/^net\.ipv4\.tcp_congestion_control.*/net.ipv4.tcp_congestion_control = bbr/" /etc/sysctl.conf || sed_fail2=1
     else
-        echo "net.ipv4.tcp_congestion_control = bbr" >> /etc/sysctl.conf
+        echo "net.ipv4.tcp_congestion_control = bbr" >> /etc/sysctl.conf || sed_fail2=1
+    fi
+    if [[ "$sed_fail2" -eq 1 ]]; then
+        warn "/etc/sysctl.conf 兜底写入失败，请手动检查。"
     fi
 
     systemctl daemon-reexec 2>/dev/null || true
+
+    # —— limits 生效验证 (ulimit) ——
+    local ulimit_now
+    ulimit_now=$(ulimit -n 2>/dev/null || echo "?")
+    info "当前 ulimit -n: ${ulimit_now} (期望 >= ${nofile_limit})"
+    if [[ "$ulimit_now" =~ ^[0-9]+$ && "$ulimit_now" -lt "$nofile_limit" ]]; then
+        warn "ulimit -n 未达到期望值 (当前 ${ulimit_now} < ${nofile_limit})，需重新登录或重启后生效。"
+        warn "limits.d 配置文件已写入，新 SSH session 将自动加载。"
+    elif [[ "$ulimit_now" == "$nofile_limit" || "$ulimit_now" -ge "$nofile_limit" ]]; then
+        ok "ulimit -n 已生效: ${ulimit_now}"
+    fi
 
     # 验证
     local qd cc
@@ -734,8 +790,6 @@ generate_custom_template() {
 # 编辑后运行: sudo bash $tmpl
 # ============================================================
 
-set -e
-
 #@ 内存上限 (GB)
 MEM_GB=${RAM_GB_CEIL}
 
@@ -762,7 +816,7 @@ NETDEV_BACKLOG=${TV[netdev_max_backlog]}
 BUF_MAX=${TV[buf_max]}
 
 #@ rmem_max / wmem_max
-RMMEM_MAX=\$BUF_MAX
+RMEM_MAX=\$BUF_MAX
 WMEM_MAX=\$BUF_MAX
 
 #@ tcp_rmem 中间值
@@ -816,8 +870,8 @@ net.core.netdev_max_backlog = '\$NETDEV_BACKLOG'
 # 维持 default 较小，仅提高 max，满足突发大流量及 QUIC 需求
 net.core.rmem_max = '\$BUF_MAX'
 net.core.wmem_max = '\$BUF_MAX'
-net.ipv4.tcp_rmem = 16384 '\$RMEM_DEFAULT' '\$BUF_MAX'
-net.ipv4.tcp_wmem = 16384 '\$WMEM_DEFAULT' '\$BUF_MAX'
+net.ipv4.tcp_rmem = 4096 '\$RMEM_DEFAULT' '\$BUF_MAX'
+net.ipv4.tcp_wmem = 4096 '\$WMEM_DEFAULT' '\$BUF_MAX'
 
 # === 内存压榨策略 ===
 net.ipv4.tcp_adv_win_scale = '\$ADV_WIN_SCALE'
@@ -828,6 +882,7 @@ net.ipv4.tcp_timestamps = 1
 net.ipv4.tcp_window_scaling = 1
 net.ipv4.tcp_tw_reuse = 1
 net.ipv4.tcp_fin_timeout = '\$FIN_TIMEOUT'
+net.ipv4.tcp_slow_start_after_idle = 0
 
 # TCP Fast Open 降低延迟
 net.ipv4.tcp_fastopen = '\$FASTOPEN'
@@ -857,14 +912,19 @@ cat > /etc/security/limits.d/99-custom-limits.conf <<EOF
 * hard nproc '\$NOFILE_LIMIT'
 EOF
 
-# Systemd 补丁
-sed -i "/^#*DefaultLimitNOFILE=/c DefaultLimitNOFILE='\$NOFILE_LIMIT'" /etc/systemd/system.conf
-sed -i "/^#*DefaultLimitNPROC=/c DefaultLimitNPROC='\$NOFILE_LIMIT'" /etc/systemd/system.conf
+# Systemd 补丁 (失败时提示)
+sed -i "/^#*DefaultLimitNOFILE=/c DefaultLimitNOFILE='\$NOFILE_LIMIT'" /etc/systemd/system.conf 2>/dev/null || echo "  [WARN] systemd DefaultLimitNOFILE 写入失败，请手动检查"
+sed -i "/^#*DefaultLimitNPROC=/c DefaultLimitNPROC='\$NOFILE_LIMIT'" /etc/systemd/system.conf 2>/dev/null || echo "  [WARN] systemd DefaultLimitNPROC 写入失败，请手动检查"
 
-# 应用
-sysctl --system
-systemctl daemon-reexec
+# 应用 (失败时提示)
+if ! sysctl --system 2>&1 | grep -qiE "error|unknown|invalid"; then :; else
+    echo "  [WARN] sysctl --system 可能存在部分错误，请查看上方输出"
+fi
+systemctl daemon-reexec 2>/dev/null || echo "  [WARN] systemctl daemon-reexec 失败"
 
+# 验证 limits 生效情况
+ULIMIT_NOW=\$(ulimit -n 2>/dev/null || echo "?")
+echo "  ulimit -n: \${ULIMIT_NOW} (期望 >= \${NOFILE_LIMIT})"
 echo ""
 echo "============================================"
 echo "  自定义 TCP 调优已完成！"
@@ -900,9 +960,17 @@ generate_ai_prompt() {
 - BBRv3 内核: $($BBRV3_READY && echo "已安装" || echo "未安装")
 
 ## 网络延迟
-- IPv4 到 120.241.152.135: $([[ $(echo "$LATENCY_IPV4_MS > 0" | bc -l 2>/dev/null) == "1" ]] && echo "${LATENCY_IPV4_MS} ms" || echo "不可达")$
-- IPv6 到 2409:8c54:871:1001::12: $([[ $(echo "$LATENCY_IPV6_MS > 0" | bc -l 2>/dev/null) == "1" ]] && echo "${LATENCY_IPV6_MS} ms" || echo "不可达")$
+- IPv4 到 120.241.152.135: $([[ $(echo "$LATENCY_IPV4_MS > 0" | bc -l 2>/dev/null) == "1" ]] && echo "${LATENCY_IPV4_MS} ms" || echo "不可达")
+- IPv6 到 2409:8c54:871:1001::12: $([[ $(echo "$LATENCY_IPV6_MS > 0" | bc -l 2>/dev/null) == "1" ]] && echo "${LATENCY_IPV6_MS} ms" || echo "不可达")
 - 选用延迟基准: ${CHOSEN_IP_STACK} ${CHOSEN_LATENCY_MS}ms
+
+## 环境补充信息
+- 内核上游: ${SOURCE} ($([[ "$SOURCE" == "xdflight" ]] && echo "XDflight 内核默认编译 qdisc 可能为 fq_codel" || echo "byJoey 内核默认编译 fq"))
+- 当前运行时 qdisc: $(sysctl -n net.core.default_qdisc 2>/dev/null || echo unknown)
+- 当前运行时 cc: $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo unknown)
+- sch_fq 模块: $(lsmod 2>/dev/null | grep -q sch_fq && echo "已加载" || find "/lib/modules/$(uname -r)" -name "sch_fq.ko*" 2>/dev/null | grep -q . && echo "存在但未加载" || echo "内置或不可用")
+- systemd-networkd: $(systemctl is-active systemd-networkd 2>/dev/null || echo unknown)
+- 特别注意: Ubuntu 24+ 使用 netplan/systemd-networkd 管理网络，可能覆盖 sysctl qdisc 设置
 
 ## 已计算的基准参数
 - BDP (带宽延迟积): ${bdp_mb} MB
@@ -916,6 +984,7 @@ generate_ai_prompt() {
   - tcp_wmem = 4096 ${TV[tcp_wmem_default]} ${TV[buf_max]}
   - tcp_adv_win_scale = ${TV[tcp_adv_win_scale]}
   - tcp_fin_timeout = ${TV[tcp_fin_timeout]}
+  - tcp_slow_start_after_idle = 0
   - tcp_fastopen = 3
   - tcp_mtu_probing = 1
   - tcp_keepalive_time = ${TV[keepalive_time]}
@@ -929,7 +998,9 @@ generate_ai_prompt() {
 1. 根据 ${RAM_GB_CEIL}G 内存和 ${BANDWIDTH_MBPS}Mbps 带宽重新计算最合理的参数
 2. 根据 ${CHOSEN_LATENCY_MS}ms 延迟调整超时和保活参数
 3. 给出每项参数的注释说明为什么选择这个值
-4. 如果有更激进或更保守的调优建议，也请一并列出
+4. 脚本中每个写入操作 (sed -i / cat > / sysctl --system 等) 都需要检测是否失败，如果失败要输出明确的错误警告
+5. 如果使用的是 XDflight 内核，请检查其默认编译选项（可能是 fq_codel 而非 fq），并给出相应的 qdisc 建议
+6. 如果是 Ubuntu 24+ 系统，请注意 systemd-networkd/netplan 可能覆盖 sysctl 中的 qdisc 设置
 
 输出格式模板 (将 [] 中的值替换为你的计算结果):
 \`\`\`bash
@@ -959,6 +1030,7 @@ net.ipv4.tcp_timestamps = 1
 net.ipv4.tcp_window_scaling = 1
 net.ipv4.tcp_tw_reuse = 1
 net.ipv4.tcp_fin_timeout = [你的建议值]
+net.ipv4.tcp_slow_start_after_idle = 0
 net.ipv4.tcp_fastopen = 3
 net.ipv4.tcp_mtu_probing = 1
 
@@ -981,11 +1053,13 @@ cat > /etc/security/limits.d/99-custom-limits.conf <<EOF
 * hard nproc [你的建议值]
 EOF
 
-sed -i "/^#*DefaultLimitNOFILE=/c DefaultLimitNOFILE=[你的建议值]" /etc/systemd/system.conf
-sed -i "/^#*DefaultLimitNPROC=/c DefaultLimitNPROC=[你的建议值]" /etc/systemd/system.conf
+sed -i "/^#*DefaultLimitNOFILE=/c DefaultLimitNOFILE=[你的建议值]" /etc/systemd/system.conf 2>/dev/null || echo "[WARN] systemd DefaultLimitNOFILE 写入失败，请手动检查"
+sed -i "/^#*DefaultLimitNPROC=/c DefaultLimitNPROC=[你的建议值]" /etc/systemd/system.conf 2>/dev/null || echo "[WARN] systemd DefaultLimitNPROC 写入失败，请手动检查"
 
-sysctl --system
-systemctl daemon-reexec
+if ! sysctl --system 2>&1 | grep -qiE "error|unknown|invalid"; then :; else
+    echo "[WARN] sysctl --system 可能存在部分错误，请查看上方输出"
+fi
+systemctl daemon-reexec 2>/dev/null || echo "[WARN] systemctl daemon-reexec 失败"
 '
 \`\`\`
 
@@ -1046,6 +1120,9 @@ print_final_report() {
     echo -e "    somaxconn:    ${CYAN}${TV[somaxconn]}${NC}"
     echo -e "    SYN backlog:  ${CYAN}${TV[tcp_max_syn_backlog]}${NC}"
     echo -e "    文件描述符:   ${CYAN}${TV[nofile_limit]}${NC}"
+    local ul_show
+    ul_show=$(ulimit -n 2>/dev/null || echo "?")
+    echo -e "    ulimit -n:    ${CYAN}${ul_show}${NC}"
     echo -e "    TCP FastOpen: ${CYAN}3${NC}"
     echo -e "    MTU Probing:  ${CYAN}1${NC}"
     echo -e "    Keepalive:    ${CYAN}${TV[keepalive_time]}s / ${TV[keepalive_intvl]}s / ${TV[keepalive_probes]}次${NC}"
@@ -1072,6 +1149,7 @@ print_final_report() {
     echo -e "  ${BOLD}━━━ 当前运行时状态 ━━━${NC}"
     echo -e "    qdisc:        ${GREEN}${qd_now}${NC}"
     echo -e "    cc:           ${GREEN}${cc_now}${NC}"
+    echo -e "    ulimit -n:    ${GREEN}$(ulimit -n 2>/dev/null || echo "?")${NC}"
     echo ""
 
     if $KERNEL_INSTALLED; then
