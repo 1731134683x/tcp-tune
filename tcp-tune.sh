@@ -474,6 +474,10 @@ SYSCTLEOF
 * hard nofile ${nofile_limit}
 * soft nproc ${nofile_limit}
 * hard nproc ${nofile_limit}
+root soft nofile ${nofile_limit}
+root hard nofile ${nofile_limit}
+root soft nproc ${nofile_limit}
+root hard nproc ${nofile_limit}
 LIMITSEOF
 
     ok "已写入 limits 配置: $limits_file"
@@ -499,6 +503,45 @@ LIMITSEOF
     fi
 
     ok "已更新 systemd 资源限制。"
+
+    # --- 确保 pam_limits.so 被加载 (root 用户也需显式配置) ---
+    local pam_files=("common-session" "common-session-noninteractive" "sshd" "su" "login")
+    local pam_fixed=0
+    for pf in "${pam_files[@]}"; do
+        if [[ -f "/etc/pam.d/$pf" ]]; then
+            if ! grep -q "pam_limits.so" "/etc/pam.d/$pf" 2>/dev/null; then
+                echo "session required pam_limits.so" >> "/etc/pam.d/$pf"
+                pam_fixed=1
+            fi
+        fi
+    done
+    if [[ "$pam_fixed" -eq 1 ]]; then
+        ok "已在 PAM 配置中添加 pam_limits.so (确保 limits.d 对所有用户包括 root 生效)"
+    fi
+
+    # --- /etc/profile.d 兜底 (非交互 shell / 某些 SSH 配置可能绕过 PAM) ---
+    local profile_ulimit="/etc/profile.d/zzz-tcp-tune-ulimit.sh"
+    cat > "$profile_ulimit" <<PROFEOF
+# TCP 调优: 确保文件描述符限制 (兜底，针对绕过 PAM 的 session)
+ulimit -n ${nofile_limit} 2>/dev/null || true
+ulimit -u ${nofile_limit} 2>/dev/null || true
+PROFEOF
+    chmod +x "$profile_ulimit"
+    ok "已写入 profile.d 兜底: $profile_ulimit"
+
+    # --- SSH UsePAM 检查 (无 PAM 则 limits.d 完全不生效) ---
+    if [[ -f /etc/ssh/sshd_config ]]; then
+        if ! grep -q "^UsePAM yes" /etc/ssh/sshd_config 2>/dev/null; then
+            if grep -q "^#UsePAM" /etc/ssh/sshd_config 2>/dev/null; then
+                sed -i 's/^#UsePAM.*/UsePAM yes/' /etc/ssh/sshd_config
+            elif grep -q "^UsePAM" /etc/ssh/sshd_config 2>/dev/null; then
+                sed -i 's/^UsePAM.*/UsePAM yes/' /etc/ssh/sshd_config
+            else
+                echo "UsePAM yes" >> /etc/ssh/sshd_config
+            fi
+            ok "已在 sshd_config 中启用 UsePAM yes (limits.d 依赖 PAM)"
+        fi
+    fi
 }
 
 # ============================================================
@@ -608,6 +651,22 @@ apply_config() {
     fi
 
     ok "所有配置已应用！"
+
+    # --- PAM / limits 生效验证 (generate_tuning 已自动配置 PAM + profile.d 兜底) ---
+    local pam_ok=0
+    for f in common-session common-session-noninteractive sshd login su; do
+        if grep -q "pam_limits.so" "/etc/pam.d/$f" 2>/dev/null; then
+            pam_ok=1
+            break
+        fi
+    done
+    if [[ "$pam_ok" -eq 1 ]]; then
+        ok "pam_limits.so 已配置 (limits.d 将随新登录自动生效)"
+    else
+        warn "pam_limits.so 未检测到！limits.d 可能不生效。"
+        info "profile.d 兜底已写入 /etc/profile.d/zzz-tcp-tune-ulimit.sh"
+        info "当前 session 可临时执行: ulimit -n ${nofile_limit} && ulimit -u ${nofile_limit}"
+    fi
 }
 
 # ============================================================

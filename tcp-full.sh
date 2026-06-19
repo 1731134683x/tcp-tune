@@ -693,6 +693,10 @@ SYSCTLEOF
 * hard nofile ${nofile_limit}
 * soft nproc ${nofile_limit}
 * hard nproc ${nofile_limit}
+root soft nofile ${nofile_limit}
+root hard nofile ${nofile_limit}
+root soft nproc ${nofile_limit}
+root hard nproc ${nofile_limit}
 LIMITSEOF
     ok "已写入: $lf"
 
@@ -710,6 +714,45 @@ LIMITSEOF
     sed -i "/^#*DefaultLimitNPROC=/c DefaultLimitNPROC=${nofile_limit}" /etc/systemd/system.conf 2>/dev/null || sed_fail=1
     if [[ "$sed_fail" -eq 1 ]]; then
         warn "systemd 资源限制写入失败，请手动检查 /etc/systemd/system.conf。"
+    fi
+
+    # --- 确保 pam_limits.so 被加载 (root 用户也需显式配置) ---
+    local pam_files=("common-session" "common-session-noninteractive" "sshd" "su" "login")
+    local pam_fixed=0
+    for pf in "${pam_files[@]}"; do
+        if [[ -f "/etc/pam.d/$pf" ]]; then
+            if ! grep -q "pam_limits.so" "/etc/pam.d/$pf" 2>/dev/null; then
+                echo "session required pam_limits.so" >> "/etc/pam.d/$pf"
+                pam_fixed=1
+            fi
+        fi
+    done
+    if [[ "$pam_fixed" -eq 1 ]]; then
+        ok "已在 PAM 配置中添加 pam_limits.so (确保 limits.d 对所有用户包括 root 生效)"
+    fi
+
+    # --- /etc/profile.d 兜底 (非交互 shell / 某些 SSH 配置可能绕过 PAM) ---
+    local profile_ulimit="/etc/profile.d/zzz-tcp-tune-ulimit.sh"
+    cat > "$profile_ulimit" <<PROFEOF
+# TCP 调优: 确保文件描述符限制 (兜底，针对绕过 PAM 的 session)
+ulimit -n ${nofile_limit} 2>/dev/null || true
+ulimit -u ${nofile_limit} 2>/dev/null || true
+PROFEOF
+    chmod +x "$profile_ulimit"
+    ok "已写入 profile.d 兜底: $profile_ulimit"
+
+    # --- SSH UsePAM 检查 (无 PAM 则 limits.d 完全不生效) ---
+    if [[ -f /etc/ssh/sshd_config ]]; then
+        if ! grep -q "^UsePAM yes" /etc/ssh/sshd_config 2>/dev/null; then
+            if grep -q "^#UsePAM" /etc/ssh/sshd_config 2>/dev/null; then
+                sed -i 's/^#UsePAM.*/UsePAM yes/' /etc/ssh/sshd_config
+            elif grep -q "^UsePAM" /etc/ssh/sshd_config 2>/dev/null; then
+                sed -i 's/^UsePAM.*/UsePAM yes/' /etc/ssh/sshd_config
+            else
+                echo "UsePAM yes" >> /etc/ssh/sshd_config
+            fi
+            ok "已在 sshd_config 中启用 UsePAM yes (limits.d 依赖 PAM)"
+        fi
     fi
 
     # --- 应用 ---
@@ -791,6 +834,22 @@ LIMITSEOF
         ok "BBR + fq 配对正确，已运行时生效。"
     else
         warn "部分参数需重启后对新内核生效。"
+    fi
+
+    # --- PAM / limits 生效验证 (已自动配置 PAM + profile.d 兜底) ---
+    local pam_ok=0
+    for f in common-session common-session-noninteractive sshd login su; do
+        if grep -q "pam_limits.so" "/etc/pam.d/$f" 2>/dev/null; then
+            pam_ok=1
+            break
+        fi
+    done
+    if [[ "$pam_ok" -eq 1 ]]; then
+        ok "pam_limits.so 已配置 (limits.d 将随新登录自动生效)"
+    else
+        warn "pam_limits.so 未检测到！limits.d 可能不生效。"
+        info "profile.d 兜底已写入 /etc/profile.d/zzz-tcp-tune-ulimit.sh"
+        info "当前 session 可临时执行: ulimit -n ${nofile_limit} && ulimit -u ${nofile_limit}"
     fi
 }
 
@@ -935,12 +994,16 @@ vm.swappiness = 1
 vm.overcommit_memory = 1
 EOF
 
-# 用户级资源限制
+# 用户级资源限制 (* 通配符不覆盖 root，需显式添加)
 cat > /etc/security/limits.d/99-custom-limits.conf <<EOF
 * soft nofile '\$NOFILE_LIMIT'
 * hard nofile '\$NOFILE_LIMIT'
 * soft nproc '\$NOFILE_LIMIT'
 * hard nproc '\$NOFILE_LIMIT'
+root soft nofile '\$NOFILE_LIMIT'
+root hard nofile '\$NOFILE_LIMIT'
+root soft nproc '\$NOFILE_LIMIT'
+root hard nproc '\$NOFILE_LIMIT'
 EOF
 
 # Systemd 补丁 (失败时提示)
@@ -956,6 +1019,20 @@ systemctl daemon-reexec 2>/dev/null || echo "  [WARN] systemctl daemon-reexec �
 # 验证 limits 生效情况
 ULIMIT_NOW=\$(ulimit -n 2>/dev/null || echo "?")
 echo "  ulimit -n: \${ULIMIT_NOW} (期望 >= \${NOFILE_LIMIT})"
+
+# PAM 检查 (扫描所有常见 PAM 配置)
+PAM_FOUND=0
+for pam_f in common-session common-session-noninteractive sshd login su; do
+    if grep -q "pam_limits.so" "/etc/pam.d/\$pam_f" 2>/dev/null; then
+        PAM_FOUND=1
+        break
+    fi
+done
+if [[ "\$PAM_FOUND" -eq 0 ]]; then
+    echo "  [WARN] pam_limits.so 未在任何 PAM 配置中检测到，limits.d 可能不会自动生效"
+    echo "  [INFO] 建议在 /etc/pam.d/common-session 中添加: session required pam_limits.so"
+fi
+echo "  [INFO] 当前 session 可临时执行: ulimit -n \${NOFILE_LIMIT} && ulimit -u \${NOFILE_LIMIT}"
 echo ""
 echo "============================================"
 echo "  自定义 TCP 调优已完成！"
@@ -1082,6 +1159,10 @@ cat > /etc/security/limits.d/99-custom-limits.conf <<EOF
 * hard nofile [你的建议值]
 * soft nproc [你的建议值]
 * hard nproc [你的建议值]
+root soft nofile [你的建议值]
+root hard nofile [你的建议值]
+root soft nproc [你的建议值]
+root hard nproc [你的建议值]
 EOF
 
 sed -i "/^#*DefaultLimitNOFILE=/c DefaultLimitNOFILE=[你的建议值]" /etc/systemd/system.conf 2>/dev/null || echo "[WARN] systemd DefaultLimitNOFILE 写入失败，请手动检查"
