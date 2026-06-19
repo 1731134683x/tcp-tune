@@ -606,22 +606,52 @@ main() {
     setup_source
     check_current_bbr
 
-    # 尝试 API; 失败时走 fallback
-    if ! fetch_release_info "$MANUAL_TAG"; then
-        fallback_download "$MANUAL_TAG"
+    # XDflight 上游: 直接调用上游官方一键安装脚本
+    # byJoey 上游: 自行拉取 .deb 安装
+    if [[ "$SOURCE" == "xdflight" ]]; then
+        xdflight_oneclick_install
+    else
+        # 尝试 API; 失败时走 fallback
+        if ! fetch_release_info "$MANUAL_TAG"; then
+            fallback_download "$MANUAL_TAG"
+        fi
+
+        info "找到 $(echo "$DEB_URLS" | grep -c '^') 个 .deb 包:"
+        while IFS= read -r url; do
+            [[ -z "$url" ]] && continue
+            info "  -> $(basename "$url")"
+        done <<< "$DEB_URLS"
+
+        download_debs
+        install_debs
+        update_bootloader
     fi
-
-    info "找到 $(echo "$DEB_URLS" | grep -c '^') 个 .deb 包:"
-    while IFS= read -r url; do
-        [[ -z "$url" ]] && continue
-        info "  -> $(basename "$url")"
-    done <<< "$DEB_URLS"
-
-    download_debs
-    install_debs
-    update_bootloader
     enable_bbr_fq_sysctl
     print_done
+}
+
+# ---- XDflight 一键安装 ----
+xdflight_oneclick_install() {
+    local oneclick_url="https://raw.githubusercontent.com/XDflight/bbr3-debs/refs/heads/build/install_latest.sh"
+    local oneclick_script="/tmp/xdflight-install.sh"
+
+    info "使用 XDflight 官方一键安装脚本..."
+    info "下载: ${oneclick_url}"
+
+    if ! curl -4fsSL --connect-timeout 10 --max-time 60 -o "$oneclick_script" "$oneclick_url"; then
+        err "下载 XDflight 安装脚本失败，请稍后重试或切换上游。"
+        exit 1
+    fi
+
+    ok "下载完成，执行安装..."
+    bash "$oneclick_script"
+    local rc=$?
+    rm -f "$oneclick_script"
+    if [[ $rc -ne 0 ]]; then
+        err "XDflight 一键安装脚本返回非零 (exit $rc)，请检查上方输出。"
+        exit 1
+    fi
+    ok "XDflight 一键安装完成。"
 }
 
 main "$@"

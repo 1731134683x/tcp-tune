@@ -349,6 +349,30 @@ update_bootloader() {
     ok "GRUB 已更新。"
 }
 
+# ---- XDflight 一键安装 ----
+xdflight_oneclick_install() {
+    local oneclick_url="https://raw.githubusercontent.com/XDflight/bbr3-debs/refs/heads/build/install_latest.sh"
+    local oneclick_script="/tmp/xdflight-install.sh"
+
+    info "使用 XDflight 官方一键安装脚本..."
+    info "下载: ${oneclick_url}"
+
+    if ! curl -4fsSL --connect-timeout 10 --max-time 60 -o "$oneclick_script" "$oneclick_url"; then
+        err "下载 XDflight 安装脚本失败，请稍后重试或切换上游。"
+        return 1
+    fi
+
+    ok "下载完成，执行安装..."
+    bash "$oneclick_script"
+    local rc=$?
+    rm -f "$oneclick_script"
+    if [[ $rc -ne 0 ]]; then
+        err "XDflight 一键安装脚本返回非零 (exit $rc)，请检查上方输出。"
+        return 1
+    fi
+    ok "XDflight 一键安装完成。"
+}
+
 # Phase 1 主入口
 phase1_install_kernel() {
     step "Phase 1: BBRv3 内核安装"
@@ -394,23 +418,30 @@ phase1_install_kernel() {
         return
     fi
 
-    # 自动获取或 fallback
-    if ! fetch_release "$MANUAL_TAG"; then
-        if ! fallback_download "$MANUAL_TAG"; then
-            err "无法获取 BBRv3 内核，跳过安装。"
-            return
+    # XDflight 上游: 直接调用上游官方一键安装脚本
+    # byJoey 上游: 自行拉取 .deb 安装
+    if [[ "$SOURCE" == "xdflight" ]]; then
+        xdflight_oneclick_install || return
+        LATEST_TAG="xdflight-latest"
+    else
+        # 自动获取或 fallback
+        if ! fetch_release "$MANUAL_TAG"; then
+            if ! fallback_download "$MANUAL_TAG"; then
+                err "无法获取 BBRv3 内核，跳过安装。"
+                return
+            fi
         fi
+
+        info "将安装 $(echo "$DEB_URLS" | grep -c '^') 个 .deb 包:"
+        while IFS= read -r url; do
+            [[ -z "$url" ]] && continue
+            info "  -> $(basename "$url")"
+        done <<< "$DEB_URLS"
+
+        download_debs || { err "下载失败，跳过内核安装。"; return; }
+        install_debs || { err "安装失败。"; return; }
+        update_bootloader
     fi
-
-    info "将安装 $(echo "$DEB_URLS" | grep -c '^') 个 .deb 包:"
-    while IFS= read -r url; do
-        [[ -z "$url" ]] && continue
-        info "  -> $(basename "$url")"
-    done <<< "$DEB_URLS"
-
-    download_debs || { err "下载失败，跳过内核安装。"; return; }
-    install_debs || { err "安装失败。"; return; }
-    update_bootloader
 
     KERNEL_INSTALLED=true
     BBRV3_READY=true
