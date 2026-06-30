@@ -1296,7 +1296,8 @@ generate_ai_prompt() {
 #!/bin/bash
 # TCP 调优参数 -- 由 AI 根据 VPS 配置生成
 # VPS: ${vps_label}, 延迟: ${CHOSEN_IP_STACK} ${CHOSEN_LATENCY_MS}ms
-set -e
+# 注意: 不使用 set -e，每个命令已自带 || echo "[WARN]" 错误处理
+# set -e + ((counter++)) 在 counter=0 时 ((0)) 返回码为 1 会导致脚本意外退出
 
 # === 1. 备份现有配置 ===
 BACKUP_FILE="/root/sysctl-backup-\$(date +%Y%m%d%H%M%S).tgz"
