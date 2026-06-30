@@ -863,16 +863,40 @@ generate_ai_prompt() {
 1. 根据 ${RAM_GB_CEIL}G 内存和 ${BANDWIDTH_MBPS}Mbps 带宽重新计算最合理的参数
 2. 根据 ${CHOSEN_LATENCY_MS}ms 延迟调整超时和保活参数
 3. 给出每项参数的注释说明为什么选择这个值
-4. 每个写入操作都需要检测是否失败，失败要输出明确的错误警告
-5. 脚本末尾必须包含参数验证部分：逐项使用 sysctl -n 回读每个参数值，与期望值比较，不一致的输出 [WARN]
+4. 脚本开头必须备份现有配置 (tar czf /root/sysctl-backup-$(date +%Y%m%d%H%M%S).tgz /etc/sysctl.d/ /etc/sysctl.conf /etc/security/limits.d/ 2>/dev/null)
+5. 写入配置前扫描并强制禁用所有冲突 (cubic/bbr 以外的 cc, fq 以外的 qdisc)，不止注释而是直接 sed 替换
+6. 写入配置文件后，每个参数都必须用 sysctl -w 直接写入运行时，确保立竿见影
+7. 每个写入操作都需要检测是否失败，失败要输出明确的错误警告
+8. 脚本末尾必须包含参数验证部分：逐项使用 sysctl -n 回读，与期望值比较，不一致的输出 [WARN]
 
 输出格式模板 (将 [] 中的值替换为你的计算结果):
 \`\`\`bash
 #!/bin/bash
 # TCP 调优参数 -- 由 AI 根据 VPS 配置生成
 # VPS: ${vps_label}, 延迟: ${CHOSEN_LATENCY_MS}ms
+set -e
 
-cat > /etc/sysctl.d/99-zz-custom.conf <<EOF
+# === 1. 备份现有配置 ===
+BACKUP_FILE="/root/sysctl-backup-\$(date +%Y%m%d%H%M%S).tgz"
+tar czf "\$BACKUP_FILE" /etc/sysctl.d/ /etc/sysctl.conf /etc/security/limits.d/ 2>/dev/null || true
+echo "[INFO] 已备份到: \$BACKUP_FILE"
+
+# === 2. 强制扫除所有冲突 (cubic / 非bbr / 非fq qdisc) ===
+echo "[INFO] 扫描并禁用冲突配置..."
+for f in \$(grep -rlE '^[^#]*tcp_congestion_control\s*=' /etc/sysctl.d/ /usr/lib/sysctl.d/ /run/sysctl.d/ /etc/sysctl.conf 2>/dev/null || true); do
+    [[ "\$f" == *"99-zzz"* ]] && continue
+    echo "  -> 覆盖 cc 为 bbr: \$f"
+    sed -i 's/^\(net\.ipv4\.tcp_congestion_control\s*=\s*\).*/\1bbr/' "\$f" 2>/dev/null || true
+done
+for f in \$(grep -rlE '^[^#]*default_qdisc\s*=\s*(fq_codel|pfifo_fast|pfifo|mq|none|noop)' /etc/sysctl.d/ /usr/lib/sysctl.d/ /run/sysctl.d/ /etc/sysctl.conf 2>/dev/null || true); do
+    [[ "\$f" == *"99-zzz"* ]] && continue
+    echo "  -> 覆盖 qdisc 为 fq: \$f"
+    sed -i 's/^\(net\.core\.default_qdisc\s*=\s*\).*/\1fq/' "\$f" 2>/dev/null || true
+done
+echo "[OK] 冲突扫描完成。"
+
+# === 3. 写入 sysctl 配置 (99-zzz 字典序最后，压过所有) ===
+cat > /etc/sysctl.d/99-zzz-custom.conf <<EOF
 # === 核心拥塞控制 ===
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
@@ -913,7 +937,8 @@ vm.swappiness = 1
 vm.overcommit_memory = 1
 EOF
 
-cat > /etc/security/limits.d/99-custom-limits.conf <<EOF
+# === 4. 写入 limits 配置 ===
+cat > /etc/security/limits.d/99-zzz-custom-limits.conf <<EOF
 root soft nofile [你的建议值]
 root hard nofile [你的建议值]
 root soft nproc [你的建议值]
@@ -922,13 +947,37 @@ EOF
 
 sed -i "/^#*DefaultLimitNOFILE=/c DefaultLimitNOFILE=[你的建议值]" /etc/systemd/system.conf 2>/dev/null || echo "[WARN] systemd DefaultLimitNOFILE 写入失败，请手动检查"
 sed -i "/^#*DefaultLimitNPROC=/c DefaultLimitNPROC=[你的建议值]" /etc/systemd/system.conf 2>/dev/null || echo "[WARN] systemd DefaultLimitNPROC 写入失败，请手动检查"
+systemctl daemon-reexec 2>/dev/null || echo "[WARN] systemctl daemon-reexec 失败"
 
+# === 5. 加载 sysctl 配置 ===
+echo "[INFO] 加载所有 sysctl 配置..."
 if ! sysctl --system 2>&1 | grep -qiE "error|unknown|invalid"; then :; else
     echo "[WARN] sysctl --system 可能存在部分错误，请查看上方输出"
 fi
-systemctl daemon-reexec 2>/dev/null || echo "[WARN] systemctl daemon-reexec 失败"
 
-# === 验证: 逐项回读参数，确保正确应用 ===
+# === 6. 逐项 sysctl -w 强制写入运行时 (立竿见影) ===
+echo "[INFO] 逐项强制写入运行时..."
+sysctl -w net.core.default_qdisc=fq 2>/dev/null || echo "[WARN] qdisc 写入失败"
+sysctl -w net.ipv4.tcp_congestion_control=bbr 2>/dev/null || echo "[WARN] cc 写入失败"
+sysctl -w net.core.rmem_max=[你的建议值] 2>/dev/null || echo "[WARN] rmem_max 写入失败"
+sysctl -w net.core.wmem_max=[你的建议值] 2>/dev/null || echo "[WARN] wmem_max 写入失败"
+sysctl -w net.core.somaxconn=[你的建议值] 2>/dev/null || echo "[WARN] somaxconn 写入失败"
+sysctl -w net.ipv4.tcp_max_syn_backlog=[你的建议值] 2>/dev/null || echo "[WARN] tcp_max_syn_backlog 写入失败"
+sysctl -w net.core.netdev_max_backlog=[你的建议值] 2>/dev/null || echo "[WARN] netdev_max_backlog 写入失败"
+sysctl -w net.ipv4.tcp_fastopen=[你的建议值] 2>/dev/null || echo "[WARN] tcp_fastopen 写入失败"
+sysctl -w net.ipv4.tcp_mtu_probing=[你的建议值] 2>/dev/null || echo "[WARN] tcp_mtu_probing 写入失败"
+sysctl -w net.ipv4.tcp_fin_timeout=[你的建议值] 2>/dev/null || echo "[WARN] tcp_fin_timeout 写入失败"
+sysctl -w net.ipv4.tcp_slow_start_after_idle=[你的建议值] 2>/dev/null || echo "[WARN] tcp_slow_start_after_idle 写入失败"
+sysctl -w net.ipv4.tcp_keepalive_time=[你的建议值] 2>/dev/null || echo "[WARN] keepalive_time 写入失败"
+sysctl -w net.ipv4.tcp_keepalive_intvl=[你的建议值] 2>/dev/null || echo "[WARN] keepalive_intvl 写入失败"
+sysctl -w net.ipv4.tcp_keepalive_probes=[你的建议值] 2>/dev/null || echo "[WARN] keepalive_probes 写入失败"
+sysctl -w net.ipv4.tcp_rmem="[min] [default] [max]" 2>/dev/null || echo "[WARN] tcp_rmem 写入失败"
+sysctl -w net.ipv4.tcp_wmem="[min] [default] [max]" 2>/dev/null || echo "[WARN] tcp_wmem 写入失败"
+sysctl -w net.ipv4.tcp_adv_win_scale=[你的建议值] 2>/dev/null || echo "[WARN] tcp_adv_win_scale 写入失败"
+sysctl -w fs.file-max=[你的建议值] 2>/dev/null || echo "[WARN] fs.file-max 写入失败"
+echo "[OK] 所有参数已强制写入运行时。"
+
+# === 7. 验证: 逐项回读参数，确保正确应用 ===
 echo ""
 echo "===== 参数验证 ====="
 _pass=0; _fail=0
