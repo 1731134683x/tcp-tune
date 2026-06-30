@@ -288,7 +288,6 @@ generate_tuning() {
     # 更合理的上限: 每G内存约 20MB 缓冲区
     mem_cap_buf=$(( RAM_GB_CEIL * 20 * 1024 * 1024 ))
 
-    local buf_max
     if [[ $target_buf -lt $mem_cap_buf ]]; then
         buf_max=$target_buf
     else
@@ -307,9 +306,6 @@ generate_tuning() {
     info "实际缓冲区上限 = $(echo "scale=2; $buf_max/1024/1024" | bc) MB"
 
     # --- 根据内存确定各类参数 ---
-    local somaxconn tcp_max_syn_backlog netdev_max_backlog
-    local file_max tcp_rmem_default tcp_wmem_default tcp_rmem_max tcp_wmem_max
-
     # 内存分档
     if [[ $RAM_GB_CEIL -le 1 ]]; then
         # 1G 内存
@@ -358,15 +354,13 @@ generate_tuning() {
         tcp_wmem_default=134217728
     fi
 
-    local buf_max_mb
     buf_max_mb=$(echo "scale=0; $buf_max/1024/1024" | bc)
     info "生成参数: somaxconn=$somaxconn, nofile=$nofile_limit, buf_max=${buf_max_mb}MB"
 
+    # 内存压榨策略 (全局变量，供 AI 提示词引用)
+    tcp_adv_win_scale=$(( RAM_GB_CEIL <= 2 ? 30 : 20 ))
+
     # --- 根据延迟调整参数 ---
-    local tcp_fastopen tcp_fin_timeout
-    local keepalive_time keepalive_intvl keepalive_probes
-    local tcp_mtu_probing
-    local tcp_slow_start_after_idle
 
     tcp_fastopen=3
     tcp_mtu_probing=1
@@ -393,7 +387,6 @@ generate_tuning() {
     fi
 
     # --- 拥塞控制算法 ---
-    local cc_algo
     if $BBRV3_READY; then
         cc_algo="bbr"
         info "将使用 bbr 拥塞控制。"
@@ -430,7 +423,7 @@ net.ipv4.tcp_rmem = 4096 ${tcp_rmem_default} ${buf_max}
 net.ipv4.tcp_wmem = 4096 ${tcp_wmem_default} ${buf_max}
 
 # === 内存压榨策略 (适配 ${RAM_GB_CEIL}G) ===
-net.ipv4.tcp_adv_win_scale = $(( RAM_GB_CEIL <= 2 ? 30 : 20 ))
+net.ipv4.tcp_adv_win_scale = ${tcp_adv_win_scale}
 
 # === 协议栈基础与代理进阶优化 ===
 net.ipv4.tcp_sack = 1
@@ -470,10 +463,6 @@ SYSCTLEOF
     # --- 写入 limits 配置 ---
     local limits_file="/etc/security/limits.d/zzz-tcp-tune-limits.conf"
     cat > "$limits_file" <<LIMITSEOF
-* soft nofile ${nofile_limit}
-* hard nofile ${nofile_limit}
-* soft nproc ${nofile_limit}
-* hard nproc ${nofile_limit}
 root soft nofile ${nofile_limit}
 root hard nofile ${nofile_limit}
 root soft nproc ${nofile_limit}
@@ -516,7 +505,7 @@ LIMITSEOF
         fi
     done
     if [[ "$pam_fixed" -eq 1 ]]; then
-        ok "已在 PAM 配置中添加 pam_limits.so (确保 limits.d 对所有用户包括 root 生效)"
+                ok "已在 PAM 配置中添加 pam_limits.so (确保 limits.d 对 root 生效)"
     fi
 
     # --- /etc/profile.d 兜底 (非交互 shell / 某些 SSH 配置可能绕过 PAM) ---
@@ -652,21 +641,339 @@ apply_config() {
 
     ok "所有配置已应用！"
 
-    # --- PAM / limits 生效验证 (generate_tuning 已自动配置 PAM + profile.d 兜底) ---
+    verify_applied
+}
+
+# ============================================================
+# 验证: 逐项回读 sysctl / ulimit / PAM，确保参数正确生效
+# ============================================================
+verify_applied() {
+    echo ""
+    info "验证参数是否正确应用..."
+
+    local pass=0 fail=0
+    local actual expected
+
+    _check() {
+        # $1=label, $2=actual, $3=expected, $4=compare_op (default: eq)
+        local label="$1" actual="$2" expected="$3" op="${4:-eq}"
+        if [[ "$op" == "ge" ]]; then
+            if [[ "$actual" =~ ^[0-9]+$ ]] && [[ "$actual" -ge "$expected" ]]; then
+                ok "  $label: ${actual} (>= ${expected}) ✓"
+                ((pass++))
+            else
+                warn "  $label: ${actual} (期望 >= ${expected})"
+                ((fail++))
+            fi
+        elif [[ "$op" == "eq" ]]; then
+            if [[ "$actual" == "$expected" ]]; then
+                ok "  $label: ${actual} ✓"
+                ((pass++))
+            else
+                warn "  $label: ${actual} (期望 ${expected})"
+                ((fail++))
+            fi
+        fi
+    }
+
+    # --- sysctl 核心参数 ---
+    actual=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "?")
+    _check "qdisc" "$actual" "${QDISC}"
+
+    actual=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "?")
+    _check "cc" "$actual" "bbr"
+
+    actual=$(sysctl -n net.core.rmem_max 2>/dev/null || echo "0")
+    _check "rmem_max" "$actual" "${buf_max}"
+
+    actual=$(sysctl -n net.core.wmem_max 2>/dev/null || echo "0")
+    _check "wmem_max" "$actual" "${buf_max}"
+
+    # tcp_rmem = "min default max"
+    actual=$(sysctl -n net.ipv4.tcp_rmem 2>/dev/null || echo "0 0 0")
+    expected="4096	${tcp_rmem_default}	${buf_max}"
+    if [[ "$actual" == "$expected" ]]; then
+        ok "  tcp_rmem: ${actual} ✓"
+        ((pass++))
+    else
+        warn "  tcp_rmem: ${actual} (期望 ${expected})"
+        ((fail++))
+    fi
+
+    actual=$(sysctl -n net.ipv4.tcp_wmem 2>/dev/null || echo "0 0 0")
+    expected="4096	${tcp_wmem_default}	${buf_max}"
+    if [[ "$actual" == "$expected" ]]; then
+        ok "  tcp_wmem: ${actual} ✓"
+        ((pass++))
+    else
+        warn "  tcp_wmem: ${actual} (期望 ${expected})"
+        ((fail++))
+    fi
+
+    actual=$(sysctl -n net.core.somaxconn 2>/dev/null || echo "?")
+    _check "somaxconn" "$actual" "${somaxconn}"
+
+    actual=$(sysctl -n net.ipv4.tcp_max_syn_backlog 2>/dev/null || echo "?")
+    _check "tcp_max_syn_backlog" "$actual" "${tcp_max_syn_backlog}"
+
+    actual=$(sysctl -n net.core.netdev_max_backlog 2>/dev/null || echo "?")
+    _check "netdev_max_backlog" "$actual" "${netdev_max_backlog}"
+
+    actual=$(sysctl -n net.ipv4.tcp_fastopen 2>/dev/null || echo "?")
+    _check "tcp_fastopen" "$actual" "${tcp_fastopen}"
+
+    actual=$(sysctl -n net.ipv4.tcp_mtu_probing 2>/dev/null || echo "?")
+    _check "tcp_mtu_probing" "$actual" "${tcp_mtu_probing}"
+
+    actual=$(sysctl -n net.ipv4.tcp_fin_timeout 2>/dev/null || echo "?")
+    _check "tcp_fin_timeout" "$actual" "${tcp_fin_timeout}"
+
+    actual=$(sysctl -n net.ipv4.tcp_slow_start_after_idle 2>/dev/null || echo "?")
+    _check "tcp_slow_start_after_idle" "$actual" "${tcp_slow_start_after_idle}"
+
+    actual=$(sysctl -n net.ipv4.tcp_keepalive_time 2>/dev/null || echo "?")
+    _check "keepalive_time" "$actual" "${keepalive_time}"
+
+    actual=$(sysctl -n net.ipv4.tcp_keepalive_intvl 2>/dev/null || echo "?")
+    _check "keepalive_intvl" "$actual" "${keepalive_intvl}"
+
+    actual=$(sysctl -n net.ipv4.tcp_keepalive_probes 2>/dev/null || echo "?")
+    _check "keepalive_probes" "$actual" "${keepalive_probes}"
+
+    actual=$(sysctl -n fs.file-max 2>/dev/null || echo "?")
+    _check "fs.file-max" "$actual" "${file_max}"
+
+    # --- ulimit ---
+    actual=$(ulimit -n 2>/dev/null || echo "?")
+    _check "ulimit -n" "$actual" "${nofile_limit}" "ge"
+
+    # --- PAM ---
     local pam_ok=0
     for f in common-session common-session-noninteractive sshd login su; do
         if grep -q "pam_limits.so" "/etc/pam.d/$f" 2>/dev/null; then
-            pam_ok=1
-            break
+            pam_ok=1; break
         fi
     done
     if [[ "$pam_ok" -eq 1 ]]; then
-        ok "pam_limits.so 已配置 (limits.d 将随新登录自动生效)"
+        ok "  pam_limits.so: 已配置 ✓"
+        ((pass++))
     else
-        warn "pam_limits.so 未检测到！limits.d 可能不生效。"
-        info "profile.d 兜底已写入 /etc/profile.d/zzz-tcp-tune-ulimit.sh"
-        info "当前 session 可临时执行: ulimit -n ${nofile_limit} && ulimit -u ${nofile_limit}"
+        warn "  pam_limits.so: 未检测到"
+        ((fail++))
     fi
+
+    # --- 小结 ---
+    echo ""
+    local total=$((pass + fail))
+    if [[ "$fail" -eq 0 ]]; then
+        ok "验证完成: ${pass}/${total} 通过，全部正确。"
+    else
+        warn "验证完成: ${pass}/${total} 通过，${fail} 项不符（可能需重启后生效）。"
+    fi
+}
+
+# ============================================================
+# Choice Menu: 应用 / AI 提示 / 跳过
+# ============================================================
+choice_menu() {
+    echo ""
+    echo -e "${CYAN}${BOLD}======================================${NC}"
+    echo -e "${CYAN}${BOLD}  选择后续操作${NC}"
+    echo -e "${CYAN}${BOLD}======================================${NC}"
+    echo ""
+    echo "  调优参数已生成并写入配置文件，请选择:"
+    echo ""
+    echo "    1) 应用设置 + 生成 AI 提示词"
+    echo "       - sysctl --system 使参数生效"
+    echo "       - 生成 AI 提示词到 /root/tcp-tune-ai-prompt.txt"
+    echo ""
+    echo "    2) 仅应用设置"
+    echo "       - sysctl --system 使参数生效"
+    echo "       - 跳过 AI 提示词"
+    echo ""
+    echo "    3) 仅生成 AI 提示词"
+    echo "       - 配置文件已写入，暂不生效"
+    echo "       - 生成 AI 提示词到 /root/tcp-tune-ai-prompt.txt"
+    echo ""
+    echo "    4) 跳过"
+    echo "       - 配置文件已写入，可稍后手动运行 sysctl --system"
+    echo ""
+    while true; do
+        read -r -p "  请选择 [1-4]: " action < /dev/tty
+        case "$action" in
+            1) return 1 ;;
+            2) return 2 ;;
+            3) return 3 ;;
+            4) return 4 ;;
+            *) warn "请输入 1、2、3 或 4" ;;
+        esac
+    done
+}
+
+# ============================================================
+# Generate AI Prompt (root 语法模板)
+# ============================================================
+generate_ai_prompt() {
+    step "生成 AI 提示词"
+
+    local ai_prompt_file="/root/tcp-tune-ai-prompt.txt"
+    local vps_label="${CPU_CORES}核 ${RAM_GB_CEIL}G ${BANDWIDTH_MBPS}Mbps"
+    local bdp_mb_val
+    bdp_mb_val=$(echo "scale=2; ${bdp_bytes:-0}/1024/1024" | bc 2>/dev/null || echo "?")
+
+    cat > "$ai_prompt_file" <<AIEOF
+你是一位 Linux 内核网络调优专家。请根据以下 VPS 的实际配置，生成一套定制化的 sysctl TCP 调优参数。
+
+## VPS 配置
+- CPU 核心数: ${CPU_CORES}
+- 内存: ${RAM_MB} MB (约 ${RAM_GB_CEIL}G)
+- 带宽: ${BANDWIDTH_MBPS} Mbps
+- 系统: ${OS_NAME} ${OS_VERSION}
+- 内核: ${KERNEL_VER}
+- BBR: $($BBRV3_READY && echo "已安装" || echo "未安装")
+
+## 网络延迟
+- IPv4 到 120.241.152.135: $( [[ $(echo "$LATENCY_IPV4_MS > 0" | bc -l 2>/dev/null) == "1" ]] && echo "${LATENCY_IPV4_MS} ms" || echo "不可达" )
+- IPv6 到 2409:8c54:871:1001::12: $( [[ $(echo "$LATENCY_IPV6_MS > 0" | bc -l 2>/dev/null) == "1" ]] && echo "${LATENCY_IPV6_MS} ms" || echo "不可达" )
+- 选用基准: ${CHOSEN_IP_STACK} ${CHOSEN_LATENCY_MS}ms
+
+## 已计算的基准参数
+- BDP: ${bdp_mb_val} MB
+- 缓冲区上限: ${buf_max_mb} MB (BDP×2 与内存限制取最小值)
+- 当前已应用:
+  - somaxconn = ${somaxconn}
+  - tcp_max_syn_backlog = ${tcp_max_syn_backlog}
+  - netdev_max_backlog = ${netdev_max_backlog}
+  - rmem_max / wmem_max = ${buf_max}
+  - tcp_rmem = 4096 ${tcp_rmem_default} ${buf_max}
+  - tcp_wmem = 4096 ${tcp_wmem_default} ${buf_max}
+  - tcp_adv_win_scale = ${tcp_adv_win_scale}
+  - tcp_fin_timeout = ${tcp_fin_timeout}
+  - tcp_slow_start_after_idle = ${tcp_slow_start_after_idle}
+  - tcp_fastopen = ${tcp_fastopen}
+  - tcp_mtu_probing = ${tcp_mtu_probing}
+  - tcp_keepalive_time = ${keepalive_time}
+  - tcp_keepalive_intvl = ${keepalive_intvl}
+  - tcp_keepalive_probes = ${keepalive_probes}
+  - fs.file-max = ${file_max}
+  - nofile / nproc 限制 = ${nofile_limit}
+
+## 输出要求
+请生成一个 **可直接以 root 执行的 bash 脚本**，格式参考如下模板。要求:
+1. 根据 ${RAM_GB_CEIL}G 内存和 ${BANDWIDTH_MBPS}Mbps 带宽重新计算最合理的参数
+2. 根据 ${CHOSEN_LATENCY_MS}ms 延迟调整超时和保活参数
+3. 给出每项参数的注释说明为什么选择这个值
+4. 每个写入操作都需要检测是否失败，失败要输出明确的错误警告
+5. 脚本末尾必须包含参数验证部分：逐项使用 sysctl -n 回读每个参数值，与期望值比较，不一致的输出 [WARN]
+
+输出格式模板 (将 [] 中的值替换为你的计算结果):
+\`\`\`bash
+#!/bin/bash
+# TCP 调优参数 -- 由 AI 根据 VPS 配置生成
+# VPS: ${vps_label}, 延迟: ${CHOSEN_LATENCY_MS}ms
+
+cat > /etc/sysctl.d/99-zz-custom.conf <<EOF
+# === 核心拥塞控制 ===
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+
+# === 流量队列与积压 (适配 ${RAM_GB_CEIL}G 内存) ===
+net.core.somaxconn = [你的建议值]
+net.ipv4.tcp_max_syn_backlog = [你的建议值]
+net.core.netdev_max_backlog = [你的建议值]
+
+# === 缓冲区 (上限 [你的建议值]MB) ===
+net.core.rmem_max = [你的建议值]
+net.core.wmem_max = [你的建议值]
+net.ipv4.tcp_rmem = [min] [default] [max]
+net.ipv4.tcp_wmem = [min] [default] [max]
+
+# === 内存压榨策略 ===
+net.ipv4.tcp_adv_win_scale = [你的建议值]
+
+# === 协议栈优化 ===
+net.ipv4.tcp_sack = 1
+net.ipv4.tcp_timestamps = 1
+net.ipv4.tcp_window_scaling = 1
+net.ipv4.tcp_tw_reuse = 1
+net.ipv4.tcp_fin_timeout = [你的建议值]
+net.ipv4.tcp_slow_start_after_idle = 0
+net.ipv4.tcp_fastopen = 3
+net.ipv4.tcp_mtu_probing = 1
+
+# === 连接保持 ===
+net.ipv4.tcp_keepalive_time = [你的建议值]
+net.ipv4.tcp_keepalive_intvl = [你的建议值]
+net.ipv4.tcp_keepalive_probes = [你的建议值]
+
+# === 系统级 ===
+fs.file-max = [你的建议值]
+kernel.panic = 10
+vm.swappiness = 1
+vm.overcommit_memory = 1
+EOF
+
+cat > /etc/security/limits.d/99-custom-limits.conf <<EOF
+root soft nofile [你的建议值]
+root hard nofile [你的建议值]
+root soft nproc [你的建议值]
+root hard nproc [你的建议值]
+EOF
+
+sed -i "/^#*DefaultLimitNOFILE=/c DefaultLimitNOFILE=[你的建议值]" /etc/systemd/system.conf 2>/dev/null || echo "[WARN] systemd DefaultLimitNOFILE 写入失败，请手动检查"
+sed -i "/^#*DefaultLimitNPROC=/c DefaultLimitNPROC=[你的建议值]" /etc/systemd/system.conf 2>/dev/null || echo "[WARN] systemd DefaultLimitNPROC 写入失败，请手动检查"
+
+if ! sysctl --system 2>&1 | grep -qiE "error|unknown|invalid"; then :; else
+    echo "[WARN] sysctl --system 可能存在部分错误，请查看上方输出"
+fi
+systemctl daemon-reexec 2>/dev/null || echo "[WARN] systemctl daemon-reexec 失败"
+
+# === 验证: 逐项回读参数，确保正确应用 ===
+echo ""
+echo "===== 参数验证 ====="
+_pass=0; _fail=0
+_check() {
+    if [[ "\$2" == "\$3" ]]; then
+        echo "  [OK] \$1: \$2"
+        ((_pass++))
+    else
+        echo "  [WARN] \$1: \$2 (期望 \$3)"
+        ((_fail++))
+    fi
+}
+_check "qdisc" "\$(sysctl -n net.core.default_qdisc)" "fq"
+_check "cc" "\$(sysctl -n net.ipv4.tcp_congestion_control)" "bbr"
+_check "rmem_max" "\$(sysctl -n net.core.rmem_max)" "[你的建议值]"
+_check "wmem_max" "\$(sysctl -n net.core.wmem_max)" "[你的建议值]"
+_check "somaxconn" "\$(sysctl -n net.core.somaxconn)" "[你的建议值]"
+_check "tcp_max_syn_backlog" "\$(sysctl -n net.ipv4.tcp_max_syn_backlog)" "[你的建议值]"
+_check "tcp_fastopen" "\$(sysctl -n net.ipv4.tcp_fastopen)" "3"
+_check "tcp_mtu_probing" "\$(sysctl -n net.ipv4.tcp_mtu_probing)" "1"
+_check "tcp_fin_timeout" "\$(sysctl -n net.ipv4.tcp_fin_timeout)" "[你的建议值]"
+_check "tcp_slow_start_after_idle" "\$(sysctl -n net.ipv4.tcp_slow_start_after_idle)" "0"
+_check "keepalive_time" "\$(sysctl -n net.ipv4.tcp_keepalive_time)" "[你的建议值]"
+_check "fs.file-max" "\$(sysctl -n fs.file-max)" "[你的建议值]"
+_ulimit=\$(ulimit -n 2>/dev/null || echo "?")
+if [[ "\$_ulimit" =~ ^[0-9]+$ ]] && [[ "\$_ulimit" -ge [你的建议值] ]]; then
+    echo "  [OK] ulimit -n: \$_ulimit (>= [你的建议值])"
+    ((_pass++))
+else
+    echo "  [WARN] ulimit -n: \$_ulimit (期望 >= [你的建议值])"
+    ((_fail++))
+fi
+echo "  验证: \$((_pass + _fail)) 项, \$_pass 通过, \$_fail 需关注"
+\`\`\`
+
+请直接输出完整结果。
+AIEOF
+
+    ok "AI 提示词已生成: $ai_prompt_file"
+    info "将此文件内容粘贴到 DeepSeek / ChatGPT 等 AI 工具获取更精细调参建议。"
+    echo ""
+    echo -e "  ${BOLD}使用方法${NC}"
+    echo "    1. cat ${ai_prompt_file}"
+    echo "    2. 复制全文 → 粘贴到 AI 对话框"
+    echo "    3. 将 AI 返回的脚本保存为 .sh，以 root 审查后运行"
 }
 
 # ============================================================
@@ -744,16 +1051,29 @@ main() {
     choose_latency
     generate_tuning
 
-    echo ""
-    ask "确认应用以上 TCP 调优配置？[Y/n]: "
-    read -r confirm < /dev/tty
-    if [[ "$confirm" == "n" || "$confirm" == "N" ]]; then
-        warn "用户取消，配置未应用。"
-        exit 0
-    fi
+    # ---- Choice menu ----
+    choice_menu
+    local action=$?
 
-    apply_config
-    print_summary
+    case $action in
+        1)  # 应用设置 + AI 提示词
+            apply_config
+            print_summary
+            generate_ai_prompt
+            ;;
+        2)  # 仅应用设置
+            apply_config
+            print_summary
+            ;;
+        3)  # 仅 AI 提示词
+            generate_ai_prompt
+            info "配置文件已写入 /etc/sysctl.d/，需要时请以 root 运行: sysctl --system"
+            ;;
+        4)  # 跳过
+            info "已跳过应用和 AI 提示词生成。"
+            info "配置文件已写入 /etc/sysctl.d/，需要时请以 root 运行: sysctl --system"
+            ;;
+    esac
 }
 
 main "$@"
