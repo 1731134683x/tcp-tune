@@ -54,7 +54,7 @@ LATENCY_IPV4_MS=0; LATENCY_IPV6_MS=0
 CHOSEN_LATENCY_MS=0; CHOSEN_IP_STACK=""
 
 # 调优参数
-BBRV3_READY=false; QDISC="fq"
+BBRV3_READY=false; QDISC="fq"  # preserve fq/fq_codel when supported
 LATEST_TAG=""; DEB_URLS=""
 KERNEL_INSTALLED=false  # 本次运行是否安装了新内核
 
@@ -461,6 +461,37 @@ phase1_install_kernel() {
 # Phase 2: VPS 检测 + 延迟测试 + TCP 调优
 # ============================================================
 
+# ============================================================
+# qdisc compatibility detection
+# ============================================================
+detect_qdisc() {
+    local current candidate
+    current=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "")
+
+    # BBRv3 kernels may intentionally use fq_codel. Preserve either supported choice.
+    case "$current" in
+        fq|fq_codel)
+            QDISC="$current"
+            ok "qdisc: ${QDISC} (preserving the active supported qdisc)"
+            return 0
+            ;;
+    esac
+
+    modprobe sch_fq 2>/dev/null || true
+    for candidate in fq fq_codel; do
+        sysctl -w "net.core.default_qdisc=${candidate}" 2>/dev/null || continue
+        current=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "")
+        if [[ "$current" == "$candidate" ]]; then
+            QDISC="$candidate"
+            ok "qdisc: ${QDISC} (detected supported qdisc)"
+            return 0
+        fi
+    done
+
+    warn "Neither fq nor fq_codel could be activated at runtime (current: ${current:-unknown})."
+    warn "Keeping fallback qdisc setting: ${QDISC}; verify after booting the target kernel."
+}
+
 detect_vps_specs() {
     step "Phase 2: VPS 检测与 TCP 调优"
 
@@ -559,8 +590,10 @@ generate_tuning() {
     bdp_bytes=$(echo "scale=0; $BANDWIDTH_MBPS * 1000000 / 8 * $CHOSEN_LATENCY_MS / 1000" | bc)
     local target_buf; target_buf=$(echo "scale=0; $bdp_bytes * 2" | bc)
 
-    # 内存上限: 每G约 20MB 缓冲
-    local mem_cap_buf; mem_cap_buf=$(( RAM_GB_CEIL * 20 * 1024 * 1024 ))
+    # Memory cap: 64MB per GB of RAM, hard-capped at 512MB (socket autotuning ceiling only).
+    local mem_cap_buf; mem_cap_buf=$(( RAM_GB_CEIL * 64 * 1024 * 1024 ))
+    local hard_cap_buf=$(( 512 * 1024 * 1024 ))
+    [[ $mem_cap_buf -gt $hard_cap_buf ]] && mem_cap_buf=$hard_cap_buf
     local buf_max
     if [[ $target_buf -lt $mem_cap_buf ]]; then buf_max=$target_buf; else buf_max=$mem_cap_buf; fi
     if [[ $buf_max -lt 4194304 ]]; then buf_max=4194304; fi  # 最小 4MB
@@ -570,29 +603,41 @@ generate_tuning() {
 
     # --- 内存分档参数 ---
     local somaxconn tcp_max_syn_backlog netdev_max_backlog file_max nofile_limit
-    local tcp_rmem_default tcp_wmem_default
+    # High-concurrency proxy: enlarge accept/SYN queues and bound default socket buffers.
+    # Xray userspace write queue cap: bound unsent data per TCP socket.
+    if [[ $RAM_GB_CEIL -le 2 ]]; then
+        tcp_notsent_lowat=131072
+    elif [[ $RAM_GB_CEIL -le 8 ]]; then
+        tcp_notsent_lowat=262144
+    else
+        tcp_notsent_lowat=524288
+    fi
 
+    local socket_default
     if [[ $RAM_GB_CEIL -le 1 ]]; then
-        somaxconn=1024; tcp_max_syn_backlog=1024; netdev_max_backlog=2048
-        file_max=512000; nofile_limit=32768
-        tcp_rmem_default=87380; tcp_wmem_default=87380
-    elif [[ $RAM_GB_CEIL -eq 2 ]]; then
-        somaxconn=2048; tcp_max_syn_backlog=2048; netdev_max_backlog=4096
-        file_max=1000000; nofile_limit=65535
-        tcp_rmem_default=16777216; tcp_wmem_default=16777216
-    elif [[ $RAM_GB_CEIL -le 4 ]]; then
         somaxconn=4096; tcp_max_syn_backlog=4096; netdev_max_backlog=8192
         file_max=1000000; nofile_limit=65535
-        tcp_rmem_default=33554432; tcp_wmem_default=33554432
-    elif [[ $RAM_GB_CEIL -le 8 ]]; then
+    elif [[ $RAM_GB_CEIL -eq 2 ]]; then
         somaxconn=8192; tcp_max_syn_backlog=8192; netdev_max_backlog=16384
         file_max=2000000; nofile_limit=131072
-        tcp_rmem_default=67108864; tcp_wmem_default=67108864
-    else
+    elif [[ $RAM_GB_CEIL -le 4 ]]; then
         somaxconn=16384; tcp_max_syn_backlog=16384; netdev_max_backlog=32768
         file_max=4000000; nofile_limit=262144
-        tcp_rmem_default=134217728; tcp_wmem_default=134217728
+    elif [[ $RAM_GB_CEIL -le 8 ]]; then
+        somaxconn=32768; tcp_max_syn_backlog=32768; netdev_max_backlog=65536
+        file_max=8000000; nofile_limit=524288
+    else
+        somaxconn=65535; tcp_max_syn_backlog=65535; netdev_max_backlog=65536
+        file_max=16000000; nofile_limit=1048576
     fi
+
+    socket_default=$(( bdp_bytes / 4 ))
+    [[ $socket_default -lt 262144 ]] && socket_default=262144
+    [[ $socket_default -gt 2097152 ]] && socket_default=2097152
+    [[ $socket_default -ge $buf_max ]] && socket_default=$(( buf_max / 2 ))
+    [[ $socket_default -lt 65536 ]] && socket_default=65536
+    tcp_rmem_default=$socket_default
+    tcp_wmem_default=$socket_default
 
     # --- 延迟分档参数 ---
     local tcp_fin_timeout keepalive_time keepalive_intvl keepalive_probes tcp_slow_start_after_idle
@@ -606,8 +651,6 @@ generate_tuning() {
         tcp_fin_timeout=20; keepalive_time=900; keepalive_intvl=30; keepalive_probes=5
     fi
 
-    local tcp_adv_win_scale
-    tcp_adv_win_scale=$(( RAM_GB_CEIL <= 2 ? 30 : 20 ))
 
     # --- 保存到全局数组 (供 Phase 3 模板引用) ---
     TV[somaxconn]=$somaxconn
@@ -617,7 +660,6 @@ generate_tuning() {
     TV[buf_max_mb]=$buf_max_mb
     TV[tcp_rmem_default]=$tcp_rmem_default
     TV[tcp_wmem_default]=$tcp_wmem_default
-    TV[tcp_adv_win_scale]=$tcp_adv_win_scale
     TV[tcp_fin_timeout]=$tcp_fin_timeout
     TV[tcp_fastopen]=3
     TV[tcp_mtu_probing]=1
@@ -626,6 +668,7 @@ generate_tuning() {
     TV[keepalive_intvl]=$keepalive_intvl
     TV[keepalive_probes]=$keepalive_probes
     TV[file_max]=$file_max
+    TV[tcp_notsent_lowat]=$tcp_notsent_lowat
     TV[nofile_limit]=$nofile_limit
     TV[bdp_mb]=$(echo "scale=2; $bdp_bytes/1024/1024" | bc)
 
@@ -641,13 +684,20 @@ generate_tuning() {
 # ============================================================
 
 # === 拥塞控制 ===
-net.core.default_qdisc = fq
+net.core.default_qdisc = ${QDISC}
 net.ipv4.tcp_congestion_control = bbr
 
 # === 队列与积压 (${RAM_GB_CEIL}G) ===
 net.core.somaxconn = ${somaxconn}
 net.ipv4.tcp_max_syn_backlog = ${tcp_max_syn_backlog}
 net.core.netdev_max_backlog = ${netdev_max_backlog}
+
+    # High-concurrency proxy connection management.
+net.ipv4.ip_local_port_range = 1024 65535
+net.ipv4.tcp_syncookies = 1
+net.ipv4.tcp_synack_retries = 3
+net.ipv4.tcp_moderate_rcvbuf = 1
+net.ipv4.tcp_notsent_lowat = ${tcp_notsent_lowat}
 
 # === 缓冲区 (BDP $(echo "scale=2; ${bdp_bytes}/1024/1024" | bc)MB, 上限 ${buf_max_mb}MB) ===
 net.core.rmem_max = ${buf_max}
@@ -656,7 +706,6 @@ net.ipv4.tcp_rmem = 4096 ${tcp_rmem_default} ${buf_max}
 net.ipv4.tcp_wmem = 4096 ${tcp_wmem_default} ${buf_max}
 
 # === 内存策略 ===
-net.ipv4.tcp_adv_win_scale = ${tcp_adv_win_scale}
 
 # === 协议栈 ===
 net.ipv4.tcp_sack = 1
@@ -674,25 +723,19 @@ net.ipv4.tcp_keepalive_intvl = ${keepalive_intvl}
 net.ipv4.tcp_keepalive_probes = ${keepalive_probes}
 
 # === IPv6 ===
-net.ipv6.conf.all.accept_ra = 2
-net.ipv6.conf.all.autoconf = 1
-net.ipv6.conf.all.disable_ipv6 = 0
 
 # === 系统级 ===
 fs.file-max = ${file_max}
-kernel.panic = 10
-vm.swappiness = 1
-vm.overcommit_memory = 1
 SYSCTLEOF
     ok "已写入: $conf"
 
     # --- limits ---
     local lf="/etc/security/limits.d/zzz-tcp-tune-limits.conf"
     cat > "$lf" <<LIMITSEOF
-root soft nofile ${nofile_limit}
-root hard nofile ${nofile_limit}
-root soft nproc ${nofile_limit}
-root hard nproc ${nofile_limit}
+* soft nofile ${nofile_limit}
+* hard nofile ${nofile_limit}
+* soft nproc ${nofile_limit}
+* hard nproc ${nofile_limit}
 LIMITSEOF
     ok "已写入: $lf"
 
@@ -711,6 +754,18 @@ LIMITSEOF
     if [[ "$sed_fail" -eq 1 ]]; then
         warn "systemd 资源限制写入失败，请手动检查 /etc/systemd/system.conf。"
     fi
+
+    # --- Xray systemd service override ---
+    local xray_dropin_dir="/etc/systemd/system/xray.service.d"
+    mkdir -p "$xray_dropin_dir"
+    cat > "$xray_dropin_dir/99-tcp-tune.conf" <<XRAYEOF
+[Service]
+LimitNOFILE=${nofile_limit}
+LimitNPROC=${nofile_limit}
+TasksMax=infinity
+XRAYEOF
+    ok "Xray systemd override written: $xray_dropin_dir/99-tcp-tune.conf"
+
 
     # --- 确保 pam_limits.so 被加载 (root 用户也需显式配置) ---
     local pam_files=("common-session" "common-session-noninteractive" "sshd" "su" "login")
@@ -758,39 +813,19 @@ PROFEOF
 apply_config() {
     # --- 应用 ---
     info "应用配置..."
-
-    # 禁用冲突配置: cubic / fq_codel / pfifo_fast 全部干掉
-    local f
-    local conflict_fail=0
-    for f in $(grep -rlE "^[^#]*tcp_congestion_control\s*=\s*cubic" /etc/sysctl.d/ /usr/lib/sysctl.d/ /run/sysctl.d/ /etc/sysctl.conf 2>/dev/null || true); do
-        [[ "$f" == *"zzz-tcp-tune"* ]] && continue
-        warn "禁用 cubic: $f"
-        sed -i "s/^net\.ipv4\.tcp_congestion_control\s*=\s*cubic/# [tcp-tune] 已禁用: &/" "$f" || { err "  修改失败: $f"; conflict_fail=1; }
-    done
-    for f in $(grep -rlE "^[^#]*default_qdisc\s*=\s*fq_codel" /etc/sysctl.d/ /usr/lib/sysctl.d/ /run/sysctl.d/ /etc/sysctl.conf 2>/dev/null || true); do
-        [[ "$f" == *"zzz-tcp-tune"* ]] && continue
-        warn "禁用 fq_codel: $f"
-        sed -i "s/^net\.core\.default_qdisc\s*=\s*fq_codel/# [tcp-tune] 已禁用: &/" "$f" || { err "  修改失败: $f"; conflict_fail=1; }
-    done
-    for f in $(grep -rlE "^[^#]*default_qdisc\s*=\s*pfifo_fast" /etc/sysctl.d/ /usr/lib/sysctl.d/ /run/sysctl.d/ /etc/sysctl.conf 2>/dev/null || true); do
-        [[ "$f" == *"zzz-tcp-tune"* ]] && continue
-        warn "禁用 pfifo_fast: $f"
-        sed -i "s/^net\.core\.default_qdisc\s*=\s*pfifo_fast/# [tcp-tune] 已禁用: &/" "$f" || { err "  修改失败: $f"; conflict_fail=1; }
-    done
-    if [[ "$conflict_fail" -eq 1 ]]; then
-        warn "部分冲突配置未能自动禁用，请手动检查上述文件。"
-    fi
+    # The dedicated zzz sysctl file is loaded last. Preserve unrelated settings.
+    # fq_codel is a supported BBRv3-compatible qdisc and must not be disabled.
 
     if sysctl --system 2>&1 | grep -qiE "error|unknown|invalid"; then
         warn "sysctl --system 可能存在部分错误，请查看上方输出。"
     fi
-    sysctl -w net.core.default_qdisc=fq 2>/dev/null || true
+    sysctl -w net.core.default_qdisc="${QDISC}" 2>/dev/null || true
     sysctl -w net.ipv4.tcp_congestion_control=bbr 2>/dev/null || true
     # 写入后立即回读验证
     local qdisc_runtime cc_runtime
     qdisc_runtime=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "")
     cc_runtime=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "")
-    if [[ "$qdisc_runtime" != "fq" ]]; then
+    if [[ "$qdisc_runtime" != "${QDISC}" ]]; then
         warn "运行时 qdisc 未能切换为 fq (当前: ${qdisc_runtime:-unknown})，重启 BBRv3 内核后生效。"
     fi
     if [[ "$cc_runtime" != "bbr" ]]; then
@@ -800,9 +835,9 @@ apply_config() {
     # /etc/sysctl.conf 兜底
     local sed_fail2=0
     if grep -q "^net\.core\.default_qdisc" /etc/sysctl.conf 2>/dev/null; then
-        sed -i "s/^net\.core\.default_qdisc.*/net.core.default_qdisc = fq/" /etc/sysctl.conf || sed_fail2=1
+        sed -i "s/^net\.core\.default_qdisc.*/net.core.default_qdisc = ${QDISC}/" /etc/sysctl.conf || sed_fail2=1
     else
-        echo "net.core.default_qdisc = fq" >> /etc/sysctl.conf || sed_fail2=1
+        echo "net.core.default_qdisc = ${QDISC}" >> /etc/sysctl.conf || sed_fail2=1
     fi
     if grep -q "^net\.ipv4\.tcp_congestion_control" /etc/sysctl.conf 2>/dev/null; then
         sed -i "s/^net\.ipv4\.tcp_congestion_control.*/net.ipv4.tcp_congestion_control = bbr/" /etc/sysctl.conf || sed_fail2=1
@@ -813,6 +848,7 @@ apply_config() {
         warn "/etc/sysctl.conf 兜底写入失败，请手动检查。"
     fi
 
+    systemctl daemon-reload 2>/dev/null || true
     systemctl daemon-reexec 2>/dev/null || true
 
     # —— limits 生效验证 (ulimit) ——
@@ -873,7 +909,7 @@ verify_applied() {
 
     # --- sysctl 核心参数 ---
     actual=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "?")
-    _check "qdisc" "$actual" "fq"
+    _check "qdisc" "$actual" "${QDISC}"
 
     actual=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "?")
     _check "cc" "$actual" "bbr"
@@ -912,6 +948,20 @@ verify_applied() {
 
     actual=$(sysctl -n net.core.netdev_max_backlog 2>/dev/null || echo "?")
     _check "netdev_max_backlog" "$actual" "${TV[netdev_max_backlog]}"
+
+    actual=$(sysctl -n net.ipv4.ip_local_port_range 2>/dev/null || echo "?")
+    _check "ip_local_port_range" "$actual" "1024	65535"
+
+    actual=$(sysctl -n net.ipv4.tcp_syncookies 2>/dev/null || echo "?")
+    _check "tcp_syncookies" "$actual" "1"
+
+    actual=$(sysctl -n net.ipv4.tcp_synack_retries 2>/dev/null || echo "?")
+    _check "tcp_synack_retries" "$actual" "3"
+
+    actual=$(sysctl -n net.ipv4.tcp_moderate_rcvbuf 2>/dev/null || echo "?")
+    _check "tcp_moderate_rcvbuf" "$actual" "1"
+    actual=$(sysctl -n net.ipv4.tcp_notsent_lowat 2>/dev/null || echo "?")
+    _check "tcp_notsent_lowat" "$actual" "${TV[tcp_notsent_lowat]}"
 
     actual=$(sysctl -n net.ipv4.tcp_fastopen 2>/dev/null || echo "?")
     _check "tcp_fastopen" "$actual" "${TV[tcp_fastopen]}"
@@ -1064,8 +1114,6 @@ RMEM_DEFAULT=${TV[tcp_rmem_default]}
 #@ tcp_wmem 中间值
 WMEM_DEFAULT=${TV[tcp_wmem_default]}
 
-#@ tcp_adv_win_scale
-ADV_WIN_SCALE=${TV[tcp_adv_win_scale]}
 
 #@ tcp_fin_timeout
 FIN_TIMEOUT=${TV[tcp_fin_timeout]}
@@ -1090,19 +1138,26 @@ FILE_MAX=${TV[file_max]}
 
 #@ nofile / nproc 限制
 NOFILE_LIMIT=${TV[nofile_limit]}
+TCP_NOTSENT_LOWAT=${TV[tcp_notsent_lowat]}
+QDISC=${QDISC}
 
 # ============================================================
 # 应用配置 (可直接运行)
 # ============================================================
 cat > /etc/sysctl.d/99-zz-custom.conf <<EOF
 # === 核心拥塞控制 ===
-net.core.default_qdisc = fq
+net.core.default_qdisc = \$QDISC
 net.ipv4.tcp_congestion_control = bbr
 
 # === 流量队列与积压 (适配 \$MEM_GB G 内存) ===
 net.core.somaxconn = \$SOMAXCONN
 net.ipv4.tcp_max_syn_backlog = \$SYN_BACKLOG
 net.core.netdev_max_backlog = \$NETDEV_BACKLOG
+net.ipv4.ip_local_port_range = 1024 65535
+net.ipv4.tcp_syncookies = 1
+net.ipv4.tcp_synack_retries = 3
+net.ipv4.tcp_moderate_rcvbuf = 1
+net.ipv4.tcp_notsent_lowat = \$TCP_NOTSENT_LOWAT
 
 # === 缓冲区: 动态上限锁定 \$(( BUF_MAX / 1024 / 1024 )) MB (防 OOM) ===
 # 维持 default 较小，仅提高 max，满足突发大流量及 QUIC 需求
@@ -1112,7 +1167,6 @@ net.ipv4.tcp_rmem = 4096 \$RMEM_DEFAULT \$BUF_MAX
 net.ipv4.tcp_wmem = 4096 \$WMEM_DEFAULT \$BUF_MAX
 
 # === 内存压榨策略 ===
-net.ipv4.tcp_adv_win_scale = \$ADV_WIN_SCALE
 
 # === 协议栈基础与代理进阶优化 ===
 net.ipv4.tcp_sack = 1
@@ -1137,17 +1191,14 @@ net.ipv4.tcp_keepalive_probes = \$KA_PROBES
 fs.file-max = \$FILE_MAX
 
 # === 系统保命机制 ===
-kernel.panic = 10
-vm.swappiness = 1
-vm.overcommit_memory = 1
 EOF
 
 # 用户级资源限制 (仅 root)
 cat > /etc/security/limits.d/99-custom-limits.conf <<EOF
-root soft nofile \$NOFILE_LIMIT
-root hard nofile \$NOFILE_LIMIT
-root soft nproc \$NOFILE_LIMIT
-root hard nproc \$NOFILE_LIMIT
+* soft nofile \$NOFILE_LIMIT
+* hard nofile \$NOFILE_LIMIT
+* soft nproc \$NOFILE_LIMIT
+* hard nproc \$NOFILE_LIMIT
 EOF
 
 # Systemd 补丁 (失败时提示)
@@ -1198,7 +1249,7 @@ _check() {
         ((_fail++))
     fi
 }
-_check "qdisc" "\$(sysctl -n net.core.default_qdisc)" "fq"
+_check "qdisc" "\$(sysctl -n net.core.default_qdisc)" "\$QDISC"
 _check "cc" "\$(sysctl -n net.ipv4.tcp_congestion_control)" "bbr"
 _check "rmem_max" "\$(sysctl -n net.core.rmem_max)" "\$BUF_MAX"
 _check "wmem_max" "\$(sysctl -n net.core.wmem_max)" "\$BUF_MAX"
@@ -1233,6 +1284,45 @@ generate_ai_prompt() {
     local bdp_mb="${TV[bdp_mb]}"
 
     cat > "$ai_prompt_file" <<AIEOF
+## XRAY_CORE_BASELINE
+The target is Xray-core. Produce one safe baseline for an Xray service; do not split the answer into Nginx/HAProxy/Docker/Kubernetes or unrelated application profiles.
+- Treat Xray as a high-concurrency user-space proxy with many inbound/outbound TCP sockets, possible UDP relay, and a mixture of persistent and short-lived connections.
+- Do not change forwarding, TProxy, policy routing, nftables/iptables, conntrack, or UDP memory parameters unless the collected runtime facts prove that this Xray host uses those features and is under pressure.
+- Generate an Xray systemd drop-in for xray.service. Set LimitNOFILE and LimitNPROC to the calculated value, set TasksMax=infinity, but do not impose MemoryMax unless an explicit service memory budget is supplied.
+- Assume the target is xray.service. Do not perform service discovery, systemctl show/cat inspection, PID lookup, or /proc process-limit probing; write the xray.service drop-in directly.
+- Prefer a dedicated late-loaded sysctl file. Do not delete or rewrite unrelated sysctl files, qdisc settings, or congestion-control settings merely because they differ. Detect and retain a supported qdisc: fq and fq_codel are both valid for BBRv3; preserve an active fq/fq_codel choice, otherwise try fq first and fq_codel as fallback. Retain rollback values.
+- Preserve Xray JSON configuration. This task tunes the OS and service limits only; do not rewrite inbounds, outbounds, routing, or policy JSON.
+
+## HIGH_CONCURRENCY_PROXY_FOCUS
+This configuration targets high-concurrency TCP proxy/forwarding workloads, not ordinary web servers. Priorities:
+1. Connection capacity and connection-establishment success rate
+2. Long-connection stability and short-connection reclamation
+3. Bounded memory usage; avoid per-connection buffers causing OOM
+4. Lower queueing latency without blindly increasing CPU usage
+
+If unknown, mark these as NEEDS_CONFIRMATION instead of guessing: proxy software/version, TCP/UDP/QUIC ratio, long/short connection ratio, expected concurrent connections, new-connection rate, NAT/iptables usage, and systemd/cgroup limits.
+
+## CONDITIONAL_PARAMETERS
+Evaluate kernel support and workload relevance, then classify each as APPLY / CONDITIONAL / DO_NOT_CHANGE:
+- TCP memory/queue: net.core.rmem_default, net.core.wmem_default, net.core.optmem_max, net.ipv4.tcp_notsent_lowat
+- High PPS/softirq: net.core.netdev_budget, net.core.netdev_budget_usecs, net.core.dev_weight; explain CPU cost
+- Orphan cleanup: net.ipv4.tcp_max_orphans, net.ipv4.tcp_orphan_retries; change only when orphan/socket memory pressure is confirmed
+- NAT/firewall: nf_conntrack_max, nf_conntrack_buckets, nf_conntrack_tcp_timeout_time_wait; only when conntrack is enabled and table usage is measured
+- UDP/QUIC: net.ipv4.udp_mem, net.ipv4.udp_rmem_min, net.ipv4.udp_wmem_min, plus rmem/wmem ceilings
+- Service limits: systemd LimitNOFILE, LimitNPROC, TasksMax, MemoryMax, and the proxy software fd/connection-pool/worker settings
+- Port planning: inspect ip_local_reserved_ports to avoid conflicts with proxy listeners, Docker/Kubernetes, or NodePort
+
+Never make every queue, conntrack limit, orphan limit, or UDP memory value enormous just because it looks larger. Give current value, calculation basis, risk, and rollback value.
+
+## DIAGNOSTICS_AND_ACCEPTANCE
+Before generating changes, collect and record sysctl values, ulimit -n, /proc/meminfo, ss -s, NIC drops/errors, softirq, and conntrack usage when available. Do not inspect Xray service metadata, processes, or per-process limits. After generation:
+- Write only parameters that exist and are writable on this kernel; skip unknown parameters with a warning
+- Make the configuration idempotent; repeated execution must not create duplicate keys
+- Provide both global sysctl and a service-level systemd override, preferring service-level limits
+- Include backup, rollback commands, and verification output
+- Provide load-test metrics: concurrent connections, connection-establishment rate, throughput, P99 latency, ESTAB/TIME_WAIT, RSS/OOM, packet drops, and CPU softirq
+- Do not modify unrelated global settings such as IPv6 routing, vm.swappiness, vm.overcommit_memory, or kernel.panic
+
 你是一位 Linux 内核网络调优专家。请根据以下 VPS 的实际配置，生成一套定制化的 sysctl TCP 调优参数。
 
 ## VPS 配置
@@ -1267,7 +1357,6 @@ generate_ai_prompt() {
   - rmem_max / wmem_max = ${TV[buf_max]}
   - tcp_rmem = 4096 ${TV[tcp_rmem_default]} ${TV[buf_max]}
   - tcp_wmem = 4096 ${TV[tcp_wmem_default]} ${TV[buf_max]}
-  - tcp_adv_win_scale = ${TV[tcp_adv_win_scale]}
   - tcp_fin_timeout = ${TV[tcp_fin_timeout]}
   - tcp_slow_start_after_idle = 0
   - tcp_fastopen = 3
@@ -1284,9 +1373,9 @@ generate_ai_prompt() {
 2. 根据 ${CHOSEN_LATENCY_MS}ms 延迟调整超时和保活参数
 3. 给出每项参数的注释说明为什么选择这个值
 4. 脚本开头必须备份现有配置 (tar czf /root/sysctl-backup-$(date +%Y%m%d%H%M%S).tgz /etc/sysctl.d/ /etc/sysctl.conf /etc/security/limits.d/ 2>/dev/null)
-5. 写入配置前扫描并强制禁用所有冲突 (cubic/bbr 以外的 cc, fq 以外的 qdisc)，不止注释而是直接 sed 替换
+5. Do not scan, detect, or rewrite unrelated sysctl files; write only a dedicated late-loaded file and retain the detected supported fq or fq_codel qdisc
 6. 写入配置文件后，每个参数都必须用 sysctl -w 直接写入运行时，确保立竿见影
-7. 如果使用的是 XDflight 内核，请检查其默认编译选项（可能是 fq_codel 而非 fq），并给出相应的 qdisc 建议
+7. Choose only fq or fq_codel: preserve a supported active fq/fq_codel; otherwise try fq first, then fq_codel. Never treat fq_codel as a conflict.
 8. 如果是 Ubuntu 24+ 系统，请注意 systemd-networkd/netplan 可能覆盖 sysctl 中的 qdisc 设置
 9. 每个写入操作都需要检测是否失败，失败要输出明确的错误警告
 10. 脚本末尾必须包含参数验证部分：逐项使用 sysctl -n 回读每个参数值，与期望值比较，不一致的输出 [WARN]
@@ -1304,24 +1393,14 @@ BACKUP_FILE="/root/sysctl-backup-\$(date +%Y%m%d%H%M%S).tgz"
 tar czf "\$BACKUP_FILE" /etc/sysctl.d/ /etc/sysctl.conf /etc/security/limits.d/ 2>/dev/null || true
 echo "[INFO] 已备份到: \$BACKUP_FILE"
 
-# === 2. 强制扫除所有冲突 (cubic / 非bbr / 非fq qdisc) ===
-echo "[INFO] 扫描并禁用冲突配置..."
-for f in \$(grep -rlE '^[^#]*tcp_congestion_control\s*=' /etc/sysctl.d/ /usr/lib/sysctl.d/ /run/sysctl.d/ /etc/sysctl.conf 2>/dev/null || true); do
-    [[ "\$f" == *"99-zzz"* ]] && continue
-    echo "  -> 覆盖 cc 为 bbr: \$f"
-    sed -i 's/^\(net\.ipv4\.tcp_congestion_control\s*=\s*\).*/\1bbr/' "\$f" 2>/dev/null || true
-done
-for f in \$(grep -rlE '^[^#]*default_qdisc\s*=\s*(fq_codel|pfifo_fast|pfifo|mq|none|noop)' /etc/sysctl.d/ /usr/lib/sysctl.d/ /run/sysctl.d/ /etc/sysctl.conf 2>/dev/null || true); do
-    [[ "\$f" == *"99-zzz"* ]] && continue
-    echo "  -> 覆盖 qdisc 为 fq: \$f"
-    sed -i 's/^\(net\.core\.default_qdisc\s*=\s*\).*/\1fq/' "\$f" 2>/dev/null || true
-done
-echo "[OK] 冲突扫描完成。"
-
+# === 2. Preserve unrelated configuration ===
+# Do not inspect or rewrite unrelated sysctl files. This dedicated late-loaded file wins.
+# Set SELECTED_QDISC to the detected supported value: fq or fq_codel.
+SELECTED_QDISC="[detected fq or fq_codel]"
 # === 3. 写入 sysctl 配置 (99-zzz 字典序最后，压过所有) ===
 cat > /etc/sysctl.d/99-zzz-custom.conf <<EOF
 # === 核心拥塞控制 ===
-net.core.default_qdisc = fq
+net.core.default_qdisc = \$SELECTED_QDISC
 net.ipv4.tcp_congestion_control = bbr
 
 # === 流量队列与积压 (适配 ${RAM_GB_CEIL}G 内存) ===
@@ -1336,7 +1415,6 @@ net.ipv4.tcp_rmem = [min] [default] [max]
 net.ipv4.tcp_wmem = [min] [default] [max]
 
 # === 内存压榨策略 ===
-net.ipv4.tcp_adv_win_scale = [你的建议值]
 
 # === 协议栈优化 ===
 net.ipv4.tcp_sack = 1
@@ -1355,9 +1433,6 @@ net.ipv4.tcp_keepalive_probes = [你的建议值]
 
 # === 系统级 ===
 fs.file-max = [你的建议值]
-kernel.panic = 10
-vm.swappiness = 1
-vm.overcommit_memory = 1
 EOF
 
 # === 4. 写入 limits 配置 ===
@@ -1380,7 +1455,7 @@ fi
 
 # === 6. 逐项 sysctl -w 强制写入运行时 (立竿见影) ===
 echo "[INFO] 逐项强制写入运行时..."
-sysctl -w net.core.default_qdisc=fq 2>/dev/null || echo "[WARN] qdisc 写入失败"
+sysctl -w net.core.default_qdisc="\$SELECTED_QDISC" 2>/dev/null || echo "[WARN] qdisc write failed"
 sysctl -w net.ipv4.tcp_congestion_control=bbr 2>/dev/null || echo "[WARN] cc 写入失败"
 sysctl -w net.core.rmem_max=[你的建议值] 2>/dev/null || echo "[WARN] rmem_max 写入失败"
 sysctl -w net.core.wmem_max=[你的建议值] 2>/dev/null || echo "[WARN] wmem_max 写入失败"
@@ -1396,7 +1471,6 @@ sysctl -w net.ipv4.tcp_keepalive_intvl=[你的建议值] 2>/dev/null || echo "[W
 sysctl -w net.ipv4.tcp_keepalive_probes=[你的建议值] 2>/dev/null || echo "[WARN] keepalive_probes 写入失败"
 sysctl -w net.ipv4.tcp_rmem="[min] [default] [max]" 2>/dev/null || echo "[WARN] tcp_rmem 写入失败"
 sysctl -w net.ipv4.tcp_wmem="[min] [default] [max]" 2>/dev/null || echo "[WARN] tcp_wmem 写入失败"
-sysctl -w net.ipv4.tcp_adv_win_scale=[你的建议值] 2>/dev/null || echo "[WARN] tcp_adv_win_scale 写入失败"
 sysctl -w fs.file-max=[你的建议值] 2>/dev/null || echo "[WARN] fs.file-max 写入失败"
 echo "[OK] 所有参数已强制写入运行时。"
 
@@ -1413,7 +1487,7 @@ _check() {
         ((_fail++))
     fi
 }
-_check "qdisc" "\$(sysctl -n net.core.default_qdisc)" "fq"
+_check "qdisc" "\$(sysctl -n net.core.default_qdisc)" "\$SELECTED_QDISC"
 _check "cc" "\$(sysctl -n net.ipv4.tcp_congestion_control)" "bbr"
 _check "rmem_max" "\$(sysctl -n net.core.rmem_max)" "[你的建议值]"
 _check "wmem_max" "\$(sysctl -n net.core.wmem_max)" "[你的建议值]"
@@ -1554,6 +1628,7 @@ main() {
     phase1_install_kernel
 
     # Phase 2
+    detect_qdisc
     detect_vps_specs
     test_latency
     choose_latency
