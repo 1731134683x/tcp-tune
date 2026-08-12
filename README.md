@@ -16,7 +16,10 @@ BBRv3 内核安装 + TCP 深度调优 + 自定义模板 + AI 提示词生成，�
 
 ```bash
 # 一键下载并运行全流程脚本
-curl -sSL https://raw.githubusercontent.com/1731134683x/tcp-tune/main/tcp-full.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/1731134683x/tcp-tune/main/tcp-full.sh | sudo bash
+
+# If a local copy was saved with Windows CRLF line endings, fix it before running
+sed -i 's/\r$//' tcp-full.sh && sudo bash tcp-full.sh
 
 # 或者单独下载某个脚本
 wget https://raw.githubusercontent.com/1731134683x/tcp-tune/main/tcp-full.sh
@@ -36,6 +39,8 @@ sudo bash tcp-full.sh --skip-kernel               # 跳过内核安装
 sudo bash tcp-full.sh --tag x86_64-7.0.3          # 指定 BBRv3 版本
 sudo bash install-bbrv3.sh --source xdflight      # 安装内核 (XDflight 上游)
 ```
+
+> **Line endings:** Shell scripts in this repository use Linux LF line endings. If Linux prints `$'\r': command not found`, the downloaded file is an old CRLF copy or was converted by a Windows editor. Run the `sed -i 's/\r$//'` command above, then retry.
 
 ## 工作流程 (tcp-full.sh)
 
