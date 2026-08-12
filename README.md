@@ -107,18 +107,18 @@ sudo bash /root/tcp-custom-template.sh
 
 模板中的参数已根据你的 VPS 规格预填，改完直接运行即可覆盖调优。
 
-## System protection baseline
+## 系统保护基线
 
-The scripts write and verify these fixed settings in `/etc/sysctl.d/zzz-tcp-tune.conf`:
+脚本会将以下默认保护参数写入并回读验证 `/etc/sysctl.d/zzz-tcp-tune.conf`：
 
 ```ini
-# Reboot 10 seconds after a kernel panic
+# 内核崩溃后 10 秒自动重启
 kernel.panic = 10
 
-# Minimize swap preference
+# 尽量降低 Swap 使用倾向
 vm.swappiness = 1
 
-# Enable heuristic memory overcommit
+# 允许启发式内存超卖
 vm.overcommit_memory = 1
 ```
 
@@ -144,7 +144,7 @@ AI 拿到后会给出每项参数的推荐值和选择理由。
 | sysctl 调优 | `/etc/sysctl.d/zzz-tcp-tune.conf` |
 | 资源限制 | `/etc/security/limits.d/zzz-tcp-tune-limits.conf` |
 | 模块加载 | `/etc/modules-load.d/tcp-tune.conf` |
-| 自定义模板 | `/root/tcp-custom-template.sh` |
+| 自定义模板 | `/root/tcp-custom-template.sh`（生成的 sysctl 覆盖文件为 `/etc/sysctl.d/zzzz-tcp-custom.conf`） |
 | AI 提示词 | `/root/tcp-ai-prompt.txt` |
 
 ## 内核来源
@@ -180,7 +180,7 @@ sysctl net.ipv4.tcp_congestion_control
 # 队列算法
 sysctl net.core.default_qdisc
 
-# 预期输出: bbr + fq
+# 预期输出: bbr + fq 或 fq_codel（取决于内核可用队列算法）
 ```
 
 ## 兼容性

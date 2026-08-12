@@ -859,7 +859,7 @@ apply_config() {
     qdisc_runtime=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "")
     cc_runtime=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "")
     if [[ "$qdisc_runtime" != "${QDISC}" ]]; then
-        warn "运行时 qdisc 未能切换为 fq (当前: ${qdisc_runtime:-unknown})，重启 BBRv3 内核后生效。"
+        warn "运行时 qdisc 未能切换为 ${QDISC} (当前: ${qdisc_runtime:-unknown})，重启 BBRv3 内核后生效。"
     fi
     if [[ "$cc_runtime" != "bbr" ]]; then
         warn "运行时 cc 未能切换为 bbr (当前: ${cc_runtime:-unknown})，重启后生效。"
@@ -900,8 +900,8 @@ apply_config() {
     qd=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "?")
     cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "?")
     ok "当前: qdisc=${qd}, cc=${cc}"
-    if [[ "$qd" == "fq" && "$cc" == "bbr" ]]; then
-        ok "BBR + fq 配对正确，已运行时生效。"
+    if [[ ( "$qd" == "fq" || "$qd" == "fq_codel" ) && "$cc" == "bbr" ]]; then
+        ok "BBR + ${qd} 配对正确，已运行时生效。"
     else
         warn "部分参数需重启后对新内核生效。"
     fi
@@ -1189,7 +1189,7 @@ QDISC=${QDISC}
 # ============================================================
 # 应用配置 (可直接运行)
 # ============================================================
-cat > /etc/sysctl.d/99-zz-custom.conf <<EOF
+cat > /etc/sysctl.d/zzzz-tcp-custom.conf <<EOF
 # === 核心拥塞控制 ===
 net.core.default_qdisc = \$QDISC
 net.ipv4.tcp_congestion_control = bbr
@@ -1301,6 +1301,9 @@ _check() {
 }
 _check "qdisc" "\$(sysctl -n net.core.default_qdisc)" "\$QDISC"
 _check "cc" "\$(sysctl -n net.ipv4.tcp_congestion_control)" "bbr"
+_check "kernel.panic" "\$(sysctl -n kernel.panic)" "10"
+_check "vm.swappiness" "\$(sysctl -n vm.swappiness)" "1"
+_check "vm.overcommit_memory" "\$(sysctl -n vm.overcommit_memory)" "1"
 _check "rmem_max" "\$(sysctl -n net.core.rmem_max)" "\$BUF_MAX"
 _check "wmem_max" "\$(sysctl -n net.core.wmem_max)" "\$BUF_MAX"
 _check "somaxconn" "\$(sysctl -n net.core.somaxconn)" "\$SOMAXCONN"
@@ -1455,11 +1458,16 @@ echo "[INFO] 已备份到: \$BACKUP_FILE"
 # Do not inspect or rewrite unrelated sysctl files. This dedicated late-loaded file wins.
 # Set SELECTED_QDISC to the detected supported value: fq or fq_codel.
 SELECTED_QDISC="[detected fq or fq_codel]"
-# === 3. 写入 sysctl 配置 (99-zzz 字典序最后，压过所有) ===
-cat > /etc/sysctl.d/99-zzz-custom.conf <<EOF
+# === 3. 写入 sysctl 配置 (zzzz 字典序最后，压过所有) ===
+cat > /etc/sysctl.d/zzzz-tcp-custom.conf <<EOF
 # === 核心拥塞控制 ===
 net.core.default_qdisc = \$SELECTED_QDISC
 net.ipv4.tcp_congestion_control = bbr
+
+# === System protection baseline ===
+kernel.panic = 10
+vm.swappiness = 1
+vm.overcommit_memory = 1
 
 # === 流量队列与积压 (适配 ${RAM_GB_CEIL}G 内存) ===
 net.core.somaxconn = [你的建议值]
@@ -1550,6 +1558,9 @@ _check() {
 }
 _check "qdisc" "\$(sysctl -n net.core.default_qdisc)" "\$SELECTED_QDISC"
 _check "cc" "\$(sysctl -n net.ipv4.tcp_congestion_control)" "bbr"
+_check "kernel.panic" "\$(sysctl -n kernel.panic)" "10"
+_check "vm.swappiness" "\$(sysctl -n vm.swappiness)" "1"
+_check "vm.overcommit_memory" "\$(sysctl -n vm.overcommit_memory)" "1"
 _check "rmem_max" "\$(sysctl -n net.core.rmem_max)" "[你的建议值]"
 _check "wmem_max" "\$(sysctl -n net.core.wmem_max)" "[你的建议值]"
 _check "somaxconn" "\$(sysctl -n net.core.somaxconn)" "[你的建议值]"
@@ -1623,7 +1634,7 @@ print_final_report() {
     # ── 调优参数 ──
     echo -e "  ${BOLD}━━━ 已应用调优 ━━━${NC}"
     echo -e "    拥塞控制:     ${GREEN}BBR${NC}"
-    echo -e "    队列算法:     ${GREEN}fq${NC}"
+    echo -e "    队列算法:     ${GREEN}${QDISC}${NC}"
     echo -e "    BDP:          ${CYAN}${TV[bdp_mb]} MB${NC}"
     echo -e "    缓冲上限:     ${CYAN}${TV[buf_max_mb]} MB${NC}"
     echo -e "    somaxconn:    ${CYAN}${TV[somaxconn]}${NC}"

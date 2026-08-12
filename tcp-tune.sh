@@ -985,11 +985,16 @@ echo "[INFO] 已备份到: \$BACKUP_FILE"
 # Do not inspect or rewrite unrelated sysctl files. This dedicated late-loaded file wins.
 # Set SELECTED_QDISC to the detected supported value: fq or fq_codel.
 SELECTED_QDISC="[detected fq or fq_codel]"
-# === 3. 写入 sysctl 配置 (99-zzz 字典序最后，压过所有) ===
-cat > /etc/sysctl.d/99-zzz-custom.conf <<EOF
+# === 3. 写入 sysctl 配置 (zzzz 字典序最后，压过所有) ===
+cat > /etc/sysctl.d/zzzz-tcp-custom.conf <<EOF
 # === 核心拥塞控制 ===
 net.core.default_qdisc = \$SELECTED_QDISC
 net.ipv4.tcp_congestion_control = bbr
+
+# === System protection baseline ===
+kernel.panic = 10
+vm.swappiness = 1
+vm.overcommit_memory = 1
 
 # === 流量队列与积压 (适配 ${RAM_GB_CEIL}G 内存) ===
 net.core.somaxconn = [你的建议值]
@@ -1080,6 +1085,9 @@ _check() {
 }
 _check "qdisc" "\$(sysctl -n net.core.default_qdisc)" "\$SELECTED_QDISC"
 _check "cc" "\$(sysctl -n net.ipv4.tcp_congestion_control)" "bbr"
+_check "kernel.panic" "\$(sysctl -n kernel.panic)" "10"
+_check "vm.swappiness" "\$(sysctl -n vm.swappiness)" "1"
+_check "vm.overcommit_memory" "\$(sysctl -n vm.overcommit_memory)" "1"
 _check "rmem_max" "\$(sysctl -n net.core.rmem_max)" "[你的建议值]"
 _check "wmem_max" "\$(sysctl -n net.core.wmem_max)" "[你的建议值]"
 _check "somaxconn" "\$(sysctl -n net.core.somaxconn)" "[你的建议值]"
