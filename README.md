@@ -107,6 +107,21 @@ sudo bash /root/tcp-custom-template.sh
 
 模板中的参数已根据你的 VPS 规格预填，改完直接运行即可覆盖调优。
 
+## System protection baseline
+
+The scripts write and verify these fixed settings in `/etc/sysctl.d/zzz-tcp-tune.conf`:
+
+```ini
+# Reboot 10 seconds after a kernel panic
+kernel.panic = 10
+
+# Minimize swap preference
+vm.swappiness = 1
+
+# Enable heuristic memory overcommit
+vm.overcommit_memory = 1
+```
+
 ## AI 提示词
 
 运行 `tcp-full.sh` 调优完成后会询问是否生成 `/root/tcp-ai-prompt.txt`：

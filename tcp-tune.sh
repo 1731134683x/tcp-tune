@@ -28,6 +28,9 @@ KERNEL_VER=""
 CPU_CORES=0
 RAM_MB=0
 RAM_GB_CEIL=0      # 向上取整后的 GB 数
+DISK_TOTAL_GB=0
+DISK_FREE_GB=0
+DISK_USED_PCT=0
 BANDWIDTH_MBPS=0
 LATENCY_IPV4_MS=0
 LATENCY_IPV6_MS=0
@@ -180,6 +183,20 @@ detect_vps_specs() {
     info "内存取整后 (向上取整): ${RAM_GB_CEIL}G"
 
     # 询问带宽
+    # Root filesystem capacity for proxy data and logs.
+    local disk_total_kb disk_avail_kb disk_used_pct
+    read -r disk_total_kb disk_avail_kb disk_used_pct < <(
+        df -Pk / 2>/dev/null | awk 'NR == 2 {gsub(/%/, "", $5); print $2, $4, $5}'
+    )
+    if [[ "$disk_total_kb" =~ ^[0-9]+$ && "$disk_avail_kb" =~ ^[0-9]+$ && "$disk_used_pct" =~ ^[0-9]+$ ]]; then
+        DISK_TOTAL_GB=$(( (disk_total_kb + 1048575) / 1048576 ))
+        DISK_FREE_GB=$(( disk_avail_kb / 1048576 ))
+        DISK_USED_PCT=$disk_used_pct
+        info "Root filesystem: ${DISK_TOTAL_GB}G total / ${DISK_FREE_GB}G available / ${DISK_USED_PCT}% used"
+    else
+        warn "Unable to read root filesystem capacity."
+    fi
+
     echo ""
     ask "请输入 VPS 带宽 (Mbps):"
     echo -e "    常见参考: 100 | 300 | 500 | 1000 (1Gbps) | 2000 (2Gbps) | 10000 (10Gbps)"
@@ -409,6 +426,7 @@ generate_tuning() {
 # TCP 深度调优配置
 # 生成时间: $(date '+%Y-%m-%d %H:%M:%S')
 # VPS 配置: ${CPU_CORES}核 / ${RAM_GB_CEIL}G 内存 / ${BANDWIDTH_MBPS}Mbps 带宽
+# Root filesystem: ${DISK_TOTAL_GB}G total / ${DISK_FREE_GB}G available / ${DISK_USED_PCT}% used
 # 延迟基准: ${CHOSEN_IP_STACK} ${CHOSEN_LATENCY_MS}ms
 # ============================================================
 
@@ -427,6 +445,14 @@ net.ipv4.tcp_syncookies = 1
 net.ipv4.tcp_synack_retries = 3
 net.ipv4.tcp_moderate_rcvbuf = 1
 net.ipv4.tcp_notsent_lowat = ${tcp_notsent_lowat}
+
+# === System protection baseline ===
+# Reboot 10 seconds after a kernel panic.
+kernel.panic = 10
+# Minimize swap preference; this does not disable swap.
+vm.swappiness = 1
+# Enable heuristic memory overcommit; continue monitoring for OOM.
+vm.overcommit_memory = 1
 
 # === 缓冲区: 动态上限 (基于 BDP, 上限 ${buf_max_mb}MB) ===
 # BDP = ${BANDWIDTH_MBPS}Mbps × ${CHOSEN_LATENCY_MS}ms = $(echo "scale=2; $bdp_bytes/1024/1024" | bc)MB
@@ -574,6 +600,9 @@ apply_config() {
     # 4. 强制运行时生效 (使用检测到的 QDISC)，写入后立即回读验证
     sysctl -w net.core.default_qdisc="${QDISC}" 2>/dev/null || true
     sysctl -w net.ipv4.tcp_congestion_control=bbr 2>/dev/null || true
+    sysctl -w kernel.panic=10 2>/dev/null || warn "kernel.panic write failed"
+    sysctl -w vm.swappiness=1 2>/dev/null || warn "vm.swappiness write failed"
+    sysctl -w vm.overcommit_memory=1 2>/dev/null || warn "vm.overcommit_memory write failed"
     local qdisc_runtime cc_runtime
     qdisc_runtime=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "")
     cc_runtime=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "")
@@ -736,6 +765,13 @@ verify_applied() {
     actual=$(sysctl -n net.ipv4.tcp_notsent_lowat 2>/dev/null || echo "?")
     _check "tcp_notsent_lowat" "$actual" "${tcp_notsent_lowat}"
 
+    actual=$(sysctl -n kernel.panic 2>/dev/null || echo "?")
+    _check "kernel.panic" "$actual" "10"
+    actual=$(sysctl -n vm.swappiness 2>/dev/null || echo "?")
+    _check "vm.swappiness" "$actual" "1"
+    actual=$(sysctl -n vm.overcommit_memory 2>/dev/null || echo "?")
+    _check "vm.overcommit_memory" "$actual" "1"
+
     actual=$(sysctl -n net.ipv4.tcp_fastopen 2>/dev/null || echo "?")
     _check "tcp_fastopen" "$actual" "${tcp_fastopen}"
 
@@ -848,6 +884,13 @@ The target is Xray-core. Produce one safe baseline for an Xray service; do not s
 - Prefer a dedicated late-loaded sysctl file. Do not delete or rewrite unrelated sysctl files, qdisc settings, or congestion-control settings merely because they differ. Detect and retain a supported qdisc: fq and fq_codel are both valid for BBRv3; preserve an active fq/fq_codel choice, otherwise try fq first and fq_codel as fallback. Retain rollback values.
 - Preserve Xray JSON configuration. This task tunes the OS and service limits only; do not rewrite inbounds, outbounds, routing, or policy JSON.
 
+## SYSTEM_PROTECTION_BASELINE
+Always apply and verify this fixed baseline in the dedicated sysctl file:
+- kernel.panic = 10
+- vm.swappiness = 1
+- vm.overcommit_memory = 1
+Do not remove or substitute these values without an explicit user request.
+
 ## HIGH_CONCURRENCY_PROXY_FOCUS
 This configuration targets high-concurrency TCP proxy/forwarding workloads, not ordinary web servers. Priorities:
 1. Connection capacity and connection-establishment success rate
@@ -876,13 +919,14 @@ Before generating changes, collect and record sysctl values, ulimit -n, /proc/me
 - Provide both global sysctl and a service-level systemd override, preferring service-level limits
 - Include backup, rollback commands, and verification output
 - Provide load-test metrics: concurrent connections, connection-establishment rate, throughput, P99 latency, ESTAB/TIME_WAIT, RSS/OOM, packet drops, and CPU softirq
-- Do not modify unrelated global settings such as IPv6 routing, vm.swappiness, vm.overcommit_memory, or kernel.panic
+- Apply the required system-protection baseline (kernel.panic=10, vm.swappiness=1, vm.overcommit_memory=1). Do not modify other unrelated global settings such as IPv6 routing
 
 你是一位 Linux 内核网络调优专家。请根据以下 VPS 的实际配置，生成一套定制化的 sysctl TCP 调优参数。
 
 ## VPS 配置
 - CPU 核心数: ${CPU_CORES}
 - 内存: ${RAM_MB} MB (约 ${RAM_GB_CEIL}G)
+- Root filesystem disk: ${DISK_TOTAL_GB}G total / ${DISK_FREE_GB}G available / ${DISK_USED_PCT}% used
 - 带宽: ${BANDWIDTH_MBPS} Mbps
 - 系统: ${OS_NAME} ${OS_VERSION}
 - 内核: ${KERNEL_VER}
@@ -1001,6 +1045,9 @@ fi
 echo "[INFO] 逐项强制写入运行时..."
 sysctl -w net.core.default_qdisc="\$SELECTED_QDISC" 2>/dev/null || echo "[WARN] qdisc write failed"
 sysctl -w net.ipv4.tcp_congestion_control=bbr 2>/dev/null || echo "[WARN] cc 写入失败"
+sysctl -w kernel.panic=10 2>/dev/null || echo "[WARN] kernel.panic write failed"
+sysctl -w vm.swappiness=1 2>/dev/null || echo "[WARN] vm.swappiness write failed"
+sysctl -w vm.overcommit_memory=1 2>/dev/null || echo "[WARN] vm.overcommit_memory write failed"
 sysctl -w net.core.rmem_max=[你的建议值] 2>/dev/null || echo "[WARN] rmem_max 写入失败"
 sysctl -w net.core.wmem_max=[你的建议值] 2>/dev/null || echo "[WARN] wmem_max 写入失败"
 sysctl -w net.core.somaxconn=[你的建议值] 2>/dev/null || echo "[WARN] somaxconn 写入失败"
@@ -1078,6 +1125,7 @@ print_summary() {
     echo -e "  ${BOLD}VPS 配置${NC}"
     echo -e "    CPU 核心:  ${CYAN}${CPU_CORES}${NC}"
     echo -e "    内存:      ${CYAN}${RAM_GB_CEIL}G${NC} (实际 ${RAM_MB}MB)"
+    echo -e "    Root disk:   ${CYAN}${DISK_TOTAL_GB}G${NC} (available ${DISK_FREE_GB}G / used ${DISK_USED_PCT}%)"
     echo -e "    带宽:      ${CYAN}${BANDWIDTH_MBPS}Mbps${NC}"
     echo ""
     echo -e "  ${BOLD}延迟测试${NC}"

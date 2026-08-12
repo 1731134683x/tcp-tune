@@ -47,7 +47,11 @@ OS_NAME=""; OS_VERSION=""; OS_ID=""; KERNEL_VER=""
 ARCH_TAG=""; ARCH_DEB=""
 
 # VPS 规格
-CPU_CORES=0; RAM_MB=0; RAM_GB_CEIL=0; BANDWIDTH_MBPS=0
+CPU_CORES=0; RAM_MB=0; RAM_GB_CEIL=0
+DISK_TOTAL_GB=0
+DISK_FREE_GB=0
+DISK_USED_PCT=0
+BANDWIDTH_MBPS=0
 
 # 延迟
 LATENCY_IPV4_MS=0; LATENCY_IPV6_MS=0
@@ -503,6 +507,20 @@ detect_vps_specs() {
     info "CPU: ${CPU_CORES} 核"
     info "内存: ${RAM_MB}MB → 向上取整 ${RAM_GB_CEIL}G"
 
+    # Root filesystem capacity for proxy data and logs.
+    local disk_total_kb disk_avail_kb disk_used_pct
+    read -r disk_total_kb disk_avail_kb disk_used_pct < <(
+        df -Pk / 2>/dev/null | awk 'NR == 2 {gsub(/%/, "", $5); print $2, $4, $5}'
+    )
+    if [[ "$disk_total_kb" =~ ^[0-9]+$ && "$disk_avail_kb" =~ ^[0-9]+$ && "$disk_used_pct" =~ ^[0-9]+$ ]]; then
+        DISK_TOTAL_GB=$(( (disk_total_kb + 1048575) / 1048576 ))
+        DISK_FREE_GB=$(( disk_avail_kb / 1048576 ))
+        DISK_USED_PCT=$disk_used_pct
+        info "Root filesystem: ${DISK_TOTAL_GB}G total / ${DISK_FREE_GB}G available / ${DISK_USED_PCT}% used"
+    else
+        warn "Unable to read root filesystem capacity."
+    fi
+
     echo ""
     ask "请输入 VPS 带宽 (Mbps):"
     echo "    常见: 100 | 300 | 500 | 1000 | 2000 | 10000"
@@ -669,6 +687,9 @@ generate_tuning() {
     TV[keepalive_probes]=$keepalive_probes
     TV[file_max]=$file_max
     TV[tcp_notsent_lowat]=$tcp_notsent_lowat
+    TV[kernel_panic]=10
+    TV[swappiness]=1
+    TV[overcommit_memory]=1
     TV[nofile_limit]=$nofile_limit
     TV[bdp_mb]=$(echo "scale=2; $bdp_bytes/1024/1024" | bc)
 
@@ -679,6 +700,7 @@ generate_tuning() {
 # TCP 深度调优 (tcp-full.sh 生成)
 # 时间: $(date '+%Y-%m-%d %H:%M:%S')
 # VPS: ${CPU_CORES}核 / ${RAM_GB_CEIL}G / ${BANDWIDTH_MBPS}Mbps
+# Root filesystem: ${DISK_TOTAL_GB}G total / ${DISK_FREE_GB}G available / ${DISK_USED_PCT}% used
 # 延迟: ${CHOSEN_IP_STACK} ${CHOSEN_LATENCY_MS}ms
 # 内核: ${KERNEL_VER}
 # ============================================================
@@ -698,6 +720,14 @@ net.ipv4.tcp_syncookies = 1
 net.ipv4.tcp_synack_retries = 3
 net.ipv4.tcp_moderate_rcvbuf = 1
 net.ipv4.tcp_notsent_lowat = ${tcp_notsent_lowat}
+
+# === System protection baseline ===
+# Reboot 10 seconds after a kernel panic.
+kernel.panic = 10
+# Minimize swap preference; this does not disable swap.
+vm.swappiness = 1
+# Enable heuristic memory overcommit; continue monitoring for OOM.
+vm.overcommit_memory = 1
 
 # === 缓冲区 (BDP $(echo "scale=2; ${bdp_bytes}/1024/1024" | bc)MB, 上限 ${buf_max_mb}MB) ===
 net.core.rmem_max = ${buf_max}
@@ -821,6 +851,9 @@ apply_config() {
     fi
     sysctl -w net.core.default_qdisc="${QDISC}" 2>/dev/null || true
     sysctl -w net.ipv4.tcp_congestion_control=bbr 2>/dev/null || true
+    sysctl -w kernel.panic=10 2>/dev/null || warn "kernel.panic write failed"
+    sysctl -w vm.swappiness=1 2>/dev/null || warn "vm.swappiness write failed"
+    sysctl -w vm.overcommit_memory=1 2>/dev/null || warn "vm.overcommit_memory write failed"
     # 写入后立即回读验证
     local qdisc_runtime cc_runtime
     qdisc_runtime=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "")
@@ -962,6 +995,13 @@ verify_applied() {
     _check "tcp_moderate_rcvbuf" "$actual" "1"
     actual=$(sysctl -n net.ipv4.tcp_notsent_lowat 2>/dev/null || echo "?")
     _check "tcp_notsent_lowat" "$actual" "${TV[tcp_notsent_lowat]}"
+
+    actual=$(sysctl -n kernel.panic 2>/dev/null || echo "?")
+    _check "kernel.panic" "$actual" "10"
+    actual=$(sysctl -n vm.swappiness 2>/dev/null || echo "?")
+    _check "vm.swappiness" "$actual" "1"
+    actual=$(sysctl -n vm.overcommit_memory 2>/dev/null || echo "?")
+    _check "vm.overcommit_memory" "$actual" "1"
 
     actual=$(sysctl -n net.ipv4.tcp_fastopen 2>/dev/null || echo "?")
     _check "tcp_fastopen" "$actual" "${TV[tcp_fastopen]}"
@@ -1139,6 +1179,11 @@ FILE_MAX=${TV[file_max]}
 #@ nofile / nproc 限制
 NOFILE_LIMIT=${TV[nofile_limit]}
 TCP_NOTSENT_LOWAT=${TV[tcp_notsent_lowat]}
+
+#@ System protection
+KERNEL_PANIC=${TV[kernel_panic]}
+VM_SWAPPINESS=${TV[swappiness]}
+VM_OVERCOMMIT_MEMORY=${TV[overcommit_memory]}
 QDISC=${QDISC}
 
 # ============================================================
@@ -1158,6 +1203,11 @@ net.ipv4.tcp_syncookies = 1
 net.ipv4.tcp_synack_retries = 3
 net.ipv4.tcp_moderate_rcvbuf = 1
 net.ipv4.tcp_notsent_lowat = \$TCP_NOTSENT_LOWAT
+
+# === System protection baseline ===
+kernel.panic = \$KERNEL_PANIC
+vm.swappiness = \$VM_SWAPPINESS
+vm.overcommit_memory = \$VM_OVERCOMMIT_MEMORY
 
 # === 缓冲区: 动态上限锁定 \$(( BUF_MAX / 1024 / 1024 )) MB (防 OOM) ===
 # 维持 default 较小，仅提高 max，满足突发大流量及 QUIC 需求
@@ -1293,6 +1343,13 @@ The target is Xray-core. Produce one safe baseline for an Xray service; do not s
 - Prefer a dedicated late-loaded sysctl file. Do not delete or rewrite unrelated sysctl files, qdisc settings, or congestion-control settings merely because they differ. Detect and retain a supported qdisc: fq and fq_codel are both valid for BBRv3; preserve an active fq/fq_codel choice, otherwise try fq first and fq_codel as fallback. Retain rollback values.
 - Preserve Xray JSON configuration. This task tunes the OS and service limits only; do not rewrite inbounds, outbounds, routing, or policy JSON.
 
+## SYSTEM_PROTECTION_BASELINE
+Always apply and verify this fixed baseline in the dedicated sysctl file:
+- kernel.panic = 10
+- vm.swappiness = 1
+- vm.overcommit_memory = 1
+Do not remove or substitute these values without an explicit user request.
+
 ## HIGH_CONCURRENCY_PROXY_FOCUS
 This configuration targets high-concurrency TCP proxy/forwarding workloads, not ordinary web servers. Priorities:
 1. Connection capacity and connection-establishment success rate
@@ -1321,13 +1378,14 @@ Before generating changes, collect and record sysctl values, ulimit -n, /proc/me
 - Provide both global sysctl and a service-level systemd override, preferring service-level limits
 - Include backup, rollback commands, and verification output
 - Provide load-test metrics: concurrent connections, connection-establishment rate, throughput, P99 latency, ESTAB/TIME_WAIT, RSS/OOM, packet drops, and CPU softirq
-- Do not modify unrelated global settings such as IPv6 routing, vm.swappiness, vm.overcommit_memory, or kernel.panic
+- Apply the required system-protection baseline (kernel.panic=10, vm.swappiness=1, vm.overcommit_memory=1). Do not modify other unrelated global settings such as IPv6 routing
 
 你是一位 Linux 内核网络调优专家。请根据以下 VPS 的实际配置，生成一套定制化的 sysctl TCP 调优参数。
 
 ## VPS 配置
 - CPU 核心数: ${CPU_CORES}
 - 内存: ${RAM_MB} MB (约 ${RAM_GB_CEIL}G)
+- Root filesystem disk: ${DISK_TOTAL_GB}G total / ${DISK_FREE_GB}G available / ${DISK_USED_PCT}% used
 - 带宽: ${BANDWIDTH_MBPS} Mbps
 - 系统: ${OS_NAME} ${OS_VERSION}
 - 内核: ${KERNEL_VER}
@@ -1457,6 +1515,9 @@ fi
 echo "[INFO] 逐项强制写入运行时..."
 sysctl -w net.core.default_qdisc="\$SELECTED_QDISC" 2>/dev/null || echo "[WARN] qdisc write failed"
 sysctl -w net.ipv4.tcp_congestion_control=bbr 2>/dev/null || echo "[WARN] cc 写入失败"
+sysctl -w kernel.panic=10 2>/dev/null || echo "[WARN] kernel.panic write failed"
+sysctl -w vm.swappiness=1 2>/dev/null || echo "[WARN] vm.swappiness write failed"
+sysctl -w vm.overcommit_memory=1 2>/dev/null || echo "[WARN] vm.overcommit_memory write failed"
 sysctl -w net.core.rmem_max=[你的建议值] 2>/dev/null || echo "[WARN] rmem_max 写入失败"
 sysctl -w net.core.wmem_max=[你的建议值] 2>/dev/null || echo "[WARN] wmem_max 写入失败"
 sysctl -w net.core.somaxconn=[你的建议值] 2>/dev/null || echo "[WARN] somaxconn 写入失败"
@@ -1542,6 +1603,7 @@ print_final_report() {
     # ── 内核 ──
     echo -e "  ${BOLD}━━━ 内核状态 ━━━${NC}"
     echo -e "    当前内核:     ${CYAN}${KERNEL_VER}${NC}"
+    echo -e "    Root disk:     ${CYAN}${DISK_TOTAL_GB}G${NC} (available ${DISK_FREE_GB}G / used ${DISK_USED_PCT}%)"
     if $KERNEL_INSTALLED; then
         echo -e "    BBRv3:        ${GREEN}已安装 (${SOURCE}/${LATEST_TAG}) — 重启后生效${NC}"
     elif $BBRV3_READY; then
