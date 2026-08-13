@@ -1411,6 +1411,17 @@ Always apply and verify this fixed baseline in the dedicated sysctl file:
 - vm.overcommit_memory = 1
 Do not remove or substitute these values without an explicit user request.
 
+## TCP_BUFFER_STARTUP_POLICY
+Do not be overly conservative with TCP socket buffers.
+Calculate tcp_rmem/tcp_wmem from BDP, use a startup default large enough for fast ramp-up,
+and keep max at least BDP rounded up.
+Do not artificially cap default to 2MiB/4MiB just because the VPS has 1GB RAM;
+only reduce it on measured memory pressure or OOM risk.
+
+## XRAY_PROXY_LOW_RETRANSMISSION
+Tune for Xray proxy with low retransmission as a priority: avoid unnecessary TCP retransmissions,
+keep loss recovery responsive, and prefer stable throughput over aggressive queue expansion.
+
 ## HIGH_CONCURRENCY_PROXY_FOCUS
 This configuration targets high-concurrency TCP proxy/forwarding workloads, not ordinary web servers. Priorities:
 1. Connection capacity and connection-establishment success rate
@@ -1463,6 +1474,9 @@ Before generating changes, collect and record sysctl values, ulimit -n, /proc/me
 - 示例：2000Mbps × 0.15s / 8 = 37.5 MB
 - 理论上每个 TCP 连接至少需要 BDP 大小的缓冲才能跑满带宽
 - 缓冲过低（如 30MB）会导致速度腰斩；应锁定在略高于理论值（如 BDP=37.5MB 时取 40MB），既喂饱带宽，又给 1G 内存留足余量、避免 OOM
+- tcp_rmem/tcp_wmem 的 default 应根据 BDP 动态计算，优先保证短连接和多线程起步速度
+- 只有检测到 socket memory pressure 或 OOM 风险时才降低 default，不要因为 1G 内存就先把 default 降到 2MiB
+- 目标场景是 Xray 代理，应优先低重传，避免因缓冲、队列或拥塞窗口设置不当引发不必要重传
 - 不要采用 512MB 这类过大的默认缓冲，1G 内存会周期性 OOM
 
 ## 环境补充信息
