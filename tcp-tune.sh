@@ -32,8 +32,8 @@ DISK_TOTAL_GB=0
 DISK_FREE_GB=0
 DISK_USED_PCT=0
 BANDWIDTH_MBPS=0
-LATENCY_IPV4_MS=0
-LATENCY_IPV6_MS=0
+LATENCY_IPV4_MS=-1
+LATENCY_IPV6_MS=-1
 CHOSEN_LATENCY_MS=0
 CHOSEN_IP_STACK=""
 BBRV3_READY=false
@@ -216,103 +216,136 @@ detect_vps_specs() {
 # ============================================================
 # Step 4: 双栈延迟测试
 # ============================================================
+# ?? ping ???????? RTT??????? ping ?????
+# ?????????????????????????????
+ping_average_ms() {
+    local log_file=$1
+    awk '
+        /(rtt|round-trip|round trip).*=/ {
+            line=$0
+            sub(/^.*=[[:space:]]*/, "", line)
+            split(line, values, "/")
+            avg=values[2]
+            sub(/[[:space:]].*$/, "", avg)
+            if (avg ~ /^[0-9]+([.][0-9]+)?$/) {
+                printf "%.1f", avg
+                exit
+            }
+        }
+    ' "$log_file"
+}
+
+ping_packet_loss() {
+    local log_file=$1
+    awk '/packet loss/ {
+        for (i = 1; i <= NF; i++) {
+            if ($i ~ /^[0-9]+([.][0-9]+)?%$/) {
+                print $i
+                exit
+            }
+        }
+    }' "$log_file"
+}
+
+latency_available() {
+    awk -v v="$1" 'BEGIN{ exit !(v ~ /^[0-9]+([.][0-9]+)?$/) }' 
+}
+
 test_latency() {
     step "Step 4: 双栈延迟测试"
 
     local ipv4_target="120.241.152.135"
     local ipv6_target="2409:8c54:871:1001::12"
+    local log_v4="/tmp/tcp-tune-ping-v4.log"
+    local log_v6="/tmp/tcp-tune-ping-v6.log"
+    local loss_v4 loss_v6
 
-    # ---- IPv4 Ping ----
-    info "正在测试 IPv4 到 $ipv4_target ..."
-    if ping -c 5 -W 2 "$ipv4_target" > /tmp/tcp-tune-ping-v4.log 2>&1; then
-        LATENCY_IPV4_MS=$(awk -F'/' '/^rtt/ {printf "%.1f", $5}' /tmp/tcp-tune-ping-v4.log)
-        local loss_v4
-        loss_v4=$(awk '/packet loss/ {print $6}' /tmp/tcp-tune-ping-v4.log)
-        ok "IPv4 延迟: ${LATENCY_IPV4_MS} ms (丢包: ${loss_v4})"
+    # ??????? RTT ??????????????????????
+    info "IPv4 Ping → $ipv4_target ..."
+    ping -c 5 -W 2 "$ipv4_target" > "$log_v4" 2>&1 || true
+    LATENCY_IPV4_MS=$(ping_average_ms "$log_v4")
+    if latency_available "$LATENCY_IPV4_MS"; then
+        loss_v4=$(ping_packet_loss "$log_v4")
+        ok "IPv4 延迟: ${LATENCY_IPV4_MS} ms (丢包: ${loss_v4:-丢包})"
     else
-        warn "IPv4 Ping 失败，可能无 IPv4 网络。"
+        warn "IPv4 Ping 失败，无法获取 RTT，可能封禁了 ICMP 或无 IPv4 路由。"
         LATENCY_IPV4_MS=-1
     fi
 
-    # ---- IPv6 Ping ----
-    info "正在测试 IPv6 到 $ipv6_target ..."
-    if ping -c 5 -W 2 "$ipv6_target" > /tmp/tcp-tune-ping-v6.log 2>&1; then
-        LATENCY_IPV6_MS=$(awk -F'/' '/^rtt/ {printf "%.1f", $5}' /tmp/tcp-tune-ping-v6.log)
-        local loss_v6
-        loss_v6=$(awk '/packet loss/ {print $6}' /tmp/tcp-tune-ping-v6.log)
-        ok "IPv6 延迟: ${LATENCY_IPV6_MS} ms (丢包: ${loss_v6})"
+    info "IPv6 Ping → $ipv6_target ..."
+    ping -c 5 -W 2 "$ipv6_target" > "$log_v6" 2>&1 || true
+    LATENCY_IPV6_MS=$(ping_average_ms "$log_v6")
+    if latency_available "$LATENCY_IPV6_MS"; then
+        loss_v6=$(ping_packet_loss "$log_v6")
+        ok "IPv6 延迟: ${LATENCY_IPV6_MS} ms (丢包: ${loss_v6:-丢包})"
     else
-        warn "IPv6 Ping 失败，可能无 IPv6 网络。"
+        warn "IPv6 Ping 失败，无法获取 RTT，可能封禁了 ICMP 或无 IPv6 路由。"
         LATENCY_IPV6_MS=-1
     fi
 }
 
-# ============================================================
-# Step 5: 用户选择延迟基准
-# ============================================================
 choose_latency() {
     step "Step 5: 选择延迟基准"
 
     echo "  测得延迟:"
-    [[ $(echo "$LATENCY_IPV4_MS > 0" | bc -l 2>/dev/null || echo 0) -eq 1 ]] \
-        && echo -e "    ${GREEN}IPv4: ${LATENCY_IPV4_MS} ms${NC}" \
-        || echo -e "    ${RED}IPv4: 不可用${NC}"
-    [[ $(echo "$LATENCY_IPV6_MS > 0" | bc -l 2>/dev/null || echo 0) -eq 1 ]] \
-        && echo -e "    ${GREEN}IPv6: ${LATENCY_IPV6_MS} ms${NC}" \
-        || echo -e "    ${RED}IPv6: 不可用${NC}"
+    if latency_available "$LATENCY_IPV4_MS"; then
+        echo -e "    ${GREEN}IPv4: ${LATENCY_IPV4_MS} ms${NC}"
+    else
+        echo -e "    ${RED}IPv4: 不可用${NC}"
+    fi
+    if latency_available "$LATENCY_IPV6_MS"; then
+        echo -e "    ${GREEN}IPv6: ${LATENCY_IPV6_MS} ms${NC}"
+    else
+        echo -e "    ${RED}IPv6: 不可用${NC}"
+    fi
 
     echo ""
-
-    # 自动判断可用选项
-    local v4_ok v6_ok
-    v4_ok=$(echo "$LATENCY_IPV4_MS > 0" | bc -l 2>/dev/null || echo 0)
-    v6_ok=$(echo "$LATENCY_IPV6_MS > 0" | bc -l 2>/dev/null || echo 0)
+    local v4_ok=0 v6_ok=0
+    latency_available "$LATENCY_IPV4_MS" && v4_ok=1
+    latency_available "$LATENCY_IPV6_MS" && v6_ok=1
 
     if [[ "$v4_ok" == "1" && "$v6_ok" == "1" ]]; then
-        echo "  请选择延迟调优基准:"
+        echo "  请选择延迟基准:"
         echo "    1) IPv4 (${LATENCY_IPV4_MS} ms)"
         echo "    2) IPv6 (${LATENCY_IPV6_MS} ms)"
-        echo "    3) 使用较高延迟 (取 max，保守策略)"
+        echo "    3) 取最大值 (取 max，更保守)"
         while true; do
-            read -r -p "  选择 [1-3]: " choice < /dev/tty
+            read -r -p "  请选择 [1-3]: " choice < /dev/tty
             case $choice in
                 1) CHOSEN_LATENCY_MS=$LATENCY_IPV4_MS; CHOSEN_IP_STACK="IPv4"; break ;;
                 2) CHOSEN_LATENCY_MS=$LATENCY_IPV6_MS; CHOSEN_IP_STACK="IPv6"; break ;;
-                3) CHOSEN_LATENCY_MS=$(echo "if($LATENCY_IPV4_MS > $LATENCY_IPV6_MS) $LATENCY_IPV4_MS else $LATENCY_IPV6_MS" | bc -l)
+                3) CHOSEN_LATENCY_MS=$(awk -v a="$LATENCY_IPV4_MS" -v b="$LATENCY_IPV6_MS" 'BEGIN{printf "%.1f", (a>b?a:b)}')
                    CHOSEN_IP_STACK="Max(IPv4/IPv6)"; break ;;
                 *) warn "请输入 1、2 或 3" ;;
             esac
         done
     elif [[ "$v4_ok" == "1" ]]; then
-        info "仅 IPv4 可用，自动选择 IPv4 延迟基准。"
+        info "仅 IPv4 可用，自动选择 IPv4。"
         CHOSEN_LATENCY_MS=$LATENCY_IPV4_MS
         CHOSEN_IP_STACK="IPv4"
     elif [[ "$v6_ok" == "1" ]]; then
-        info "仅 IPv6 可用，自动选择 IPv6 延迟基准。"
+        info "仅 IPv6 可用，自动选择 IPv6。"
         CHOSEN_LATENCY_MS=$LATENCY_IPV6_MS
         CHOSEN_IP_STACK="IPv6"
     else
-        warn "IPv4 和 IPv6 均不可达！将使用默认延迟 150ms。"
+        warn "IPv4 与 IPv6 均不可达，使用默认 150ms。"
         CHOSEN_LATENCY_MS=150
         CHOSEN_IP_STACK="默认(150ms)"
     fi
 
-    info "选择: ${GREEN}${CHOSEN_IP_STACK}${NC}, 延迟基准: ${GREEN}${CHOSEN_LATENCY_MS} ms${NC}"
+    info "延迟基准: ${GREEN}${CHOSEN_IP_STACK}${NC}, 延迟: ${GREEN}${CHOSEN_LATENCY_MS} ms${NC}"
 }
 
-# ============================================================
-# Step 6: 生成调优参数
-# ============================================================
 generate_tuning() {
     step "Step 6: 生成 TCP 调优参数 (内存: ${RAM_GB_CEIL}G / 带宽: ${BANDWIDTH_MBPS}Mbps / 延迟: ${CHOSEN_LATENCY_MS}ms)"
 
     # --- 计算 BDP (字节) ---
     # BDP = 带宽(bps) × RTT(s) / 8
     # 乘法先做，除法放到最后，避免 scale=0 导致分数被截断为 0
-    bdp_bytes=$(echo "scale=0; $BANDWIDTH_MBPS * 1000000 / 8 * $CHOSEN_LATENCY_MS / 1000" | bc)
+    bdp_bytes=$(awk -v bw="$BANDWIDTH_MBPS" -v lat="$CHOSEN_LATENCY_MS" 'BEGIN{printf "%d", bw*1000000/8*lat/1000}')
     # 目标缓冲区 = BDP × 2
     local target_buf
-    target_buf=$(echo "scale=0; $bdp_bytes * 2" | bc)
+    target_buf=$(( bdp_bytes * 2 ))
 
     # 根据内存限制缓冲区最大值
     local mem_cap_buf
@@ -326,7 +359,7 @@ generate_tuning() {
         buf_max=$target_buf
     else
         buf_max=$mem_cap_buf
-        info "BDP×2 ($(echo "scale=1; $target_buf/1024/1024" | bc)MB) 超过内存限制，上限截断为 $(echo "scale=1; $buf_max/1024/1024" | bc)MB。"
+        info "BDP×2 ($(awk -v b="$target_buf" 'BEGIN{printf "%.1f", b/1024/1024}')MB) 超过内存限制，上限截断为 $(awk -v b="$buf_max" 'BEGIN{printf "%.1f", b/1024/1024}')MB。"
     fi
 
     # 最小值 4MB
@@ -335,9 +368,9 @@ generate_tuning() {
         buf_max=$buf_min_bytes
     fi
 
-    info "BDP = $(echo "scale=2; $bdp_bytes/1024/1024" | bc) MB"
-    info "目标缓冲区 (BDP×2) = $(echo "scale=2; $target_buf/1024/1024" | bc) MB"
-    info "实际缓冲区上限 = $(echo "scale=2; $buf_max/1024/1024" | bc) MB"
+    info "BDP = $(awk -v b="$bdp_bytes" 'BEGIN{printf "%.2f", b/1024/1024}') MB"
+    info "目标缓冲区 (BDP×2) = $(awk -v b="$target_buf" 'BEGIN{printf "%.2f", b/1024/1024}') MB"
+    info "实际缓冲区上限 = $(awk -v b="$buf_max" 'BEGIN{printf "%.2f", b/1024/1024}') MB"
 
     # --- 根据内存确定各类参数 ---
     # 内存分档
@@ -378,7 +411,7 @@ generate_tuning() {
     tcp_rmem_default=$socket_default
     tcp_wmem_default=$socket_default
 
-    buf_max_mb=$(echo "scale=0; $buf_max/1024/1024" | bc)
+    buf_max_mb=$(( buf_max / 1024 / 1024 ))
     info "生成参数: somaxconn=$somaxconn, nofile=$nofile_limit, buf_max=${buf_max_mb}MB"
 
     # 内存压榨策略 (全局变量，供 AI 提示词引用)
@@ -389,13 +422,13 @@ generate_tuning() {
     tcp_mtu_probing=1
     tcp_slow_start_after_idle=0
 
-    if [[ $(echo "$CHOSEN_LATENCY_MS <= 50" | bc -l) -eq 1 ]]; then
+    if awk -v l="$CHOSEN_LATENCY_MS" 'BEGIN{exit !(l<=50)}'; then
         # 低延迟 (<50ms)
         tcp_fin_timeout=10
         keepalive_time=300
         keepalive_intvl=10
         keepalive_probes=3
-    elif [[ $(echo "$CHOSEN_LATENCY_MS <= 150" | bc -l) -eq 1 ]]; then
+    elif awk -v l="$CHOSEN_LATENCY_MS" 'BEGIN{exit !(l<=150)}'; then
         # 中等延迟 (50-150ms)
         tcp_fin_timeout=15
         keepalive_time=600
@@ -418,163 +451,7 @@ generate_tuning() {
         warn "BBR 不可用，配置中将写入 bbr 但需内核支持才能生效。"
     fi
 
-    # --- 写入 sysctl 配置 (zzz- 确保字典序最后加载，覆盖其他默认值) ---
-    local conf_file="/etc/sysctl.d/zzz-tcp-tune.conf"
-
-    cat > "$conf_file" <<SYSCTLEOF
-# ============================================================
-# TCP 深度调优配置
-# 生成时间: $(date '+%Y-%m-%d %H:%M:%S')
-# VPS 配置: ${CPU_CORES}核 / ${RAM_GB_CEIL}G 内存 / ${BANDWIDTH_MBPS}Mbps 带宽
-# Root filesystem: ${DISK_TOTAL_GB}G total / ${DISK_FREE_GB}G available / ${DISK_USED_PCT}% used
-# 延迟基准: ${CHOSEN_IP_STACK} ${CHOSEN_LATENCY_MS}ms
-# ============================================================
-
-# === 核心拥塞控制 (BBR + ${QDISC}) ===
-net.core.default_qdisc = ${QDISC}
-net.ipv4.tcp_congestion_control = ${cc_algo}
-
-# === 流量队列与积压 (适配 ${RAM_GB_CEIL}G 内存) ===
-net.core.somaxconn = ${somaxconn}
-net.ipv4.tcp_max_syn_backlog = ${tcp_max_syn_backlog}
-net.core.netdev_max_backlog = ${netdev_max_backlog}
-
-    # High-concurrency proxy connection management.
-net.ipv4.ip_local_port_range = 1024 65535
-net.ipv4.tcp_syncookies = 1
-net.ipv4.tcp_synack_retries = 3
-net.ipv4.tcp_moderate_rcvbuf = 1
-net.ipv4.tcp_notsent_lowat = ${tcp_notsent_lowat}
-
-# === System protection baseline ===
-# Reboot 10 seconds after a kernel panic.
-kernel.panic = 10
-# Minimize swap preference; this does not disable swap.
-vm.swappiness = 1
-# Enable heuristic memory overcommit; continue monitoring for OOM.
-vm.overcommit_memory = 1
-
-# === 缓冲区: 动态上限 (基于 BDP, 上限 ${buf_max_mb}MB) ===
-# BDP = ${BANDWIDTH_MBPS}Mbps × ${CHOSEN_LATENCY_MS}ms = $(echo "scale=2; $bdp_bytes/1024/1024" | bc)MB
-net.core.rmem_max = ${buf_max}
-net.core.wmem_max = ${buf_max}
-net.ipv4.tcp_rmem = 4096 ${tcp_rmem_default} ${buf_max}
-net.ipv4.tcp_wmem = 4096 ${tcp_wmem_default} ${buf_max}
-
-# === 内存压榨策略 (适配 ${RAM_GB_CEIL}G) ===
-
-# === 协议栈基础与代理进阶优化 ===
-net.ipv4.tcp_sack = 1
-net.ipv4.tcp_timestamps = 1
-net.ipv4.tcp_window_scaling = 1
-net.ipv4.tcp_tw_reuse = 1
-net.ipv4.tcp_fin_timeout = ${tcp_fin_timeout}
-net.ipv4.tcp_slow_start_after_idle = ${tcp_slow_start_after_idle}
-
-# TCP Fast Open (降低握手延迟)
-net.ipv4.tcp_fastopen = ${tcp_fastopen}
-
-# MTU 探测 (防止跨国路由黑洞)
-net.ipv4.tcp_mtu_probing = ${tcp_mtu_probing}
-
-# === 连接保持 (防僵尸连接) ===
-net.ipv4.tcp_keepalive_time = ${keepalive_time}
-net.ipv4.tcp_keepalive_intvl = ${keepalive_intvl}
-net.ipv4.tcp_keepalive_probes = ${keepalive_probes}
-
-# === IPv6 调优 (如果使用 IPv6) ===
-
-# === 系统级设置 ===
-fs.file-max = ${file_max}
-
-# === 系统保命机制 ===
-SYSCTLEOF
-
-    ok "已写入 sysctl 配置: $conf_file"
-
-    # --- 写入 limits 配置 ---
-    local limits_file="/etc/security/limits.d/zzz-tcp-tune-limits.conf"
-    cat > "$limits_file" <<LIMITSEOF
-* soft nofile ${nofile_limit}
-* hard nofile ${nofile_limit}
-* soft nproc ${nofile_limit}
-* hard nproc ${nofile_limit}
-LIMITSEOF
-
-    ok "已写入 limits 配置: $limits_file"
-
-    # --- 写入 modules-load.d (开机自动加载必需模块) ---
-    local modload_file="/etc/modules-load.d/tcp-tune.conf"
-    {
-        echo "# TCP 调优必需模块"
-        echo "tcp_bbr"
-        # 只有 fq 作为可加载模块存在时才写入 (内置则不需要)
-        if [[ "$QDISC" == "fq" ]]; then
-            find "/lib/modules/$(uname -r)" -name "sch_fq.ko*" 2>/dev/null | grep -q . && echo "sch_fq"
-        fi
-    } > "$modload_file"
-    ok "已写入模块自动加载: $modload_file"
-
-    # --- Systemd 补丁 ---
-    local sed_fail=0
-    sed -i "/^#*DefaultLimitNOFILE=/c DefaultLimitNOFILE=${nofile_limit}" /etc/systemd/system.conf 2>/dev/null || sed_fail=1
-    sed -i "/^#*DefaultLimitNPROC=/c DefaultLimitNPROC=${nofile_limit}" /etc/systemd/system.conf 2>/dev/null || sed_fail=1
-    if [[ "$sed_fail" -eq 1 ]]; then
-        warn "systemd 资源限制写入失败，请手动检查 /etc/systemd/system.conf。"
-    fi
-
-    ok "已更新 systemd 资源限制。"
-
-    # --- Xray systemd service override ---
-    local xray_dropin_dir="/etc/systemd/system/xray.service.d"
-    mkdir -p "$xray_dropin_dir"
-    cat > "$xray_dropin_dir/99-tcp-tune.conf" <<XRAYEOF
-[Service]
-LimitNOFILE=${nofile_limit}
-LimitNPROC=${nofile_limit}
-TasksMax=infinity
-XRAYEOF
-    ok "Xray systemd override written: $xray_dropin_dir/99-tcp-tune.conf"
-
-
-    # --- 确保 pam_limits.so 被加载 (root 用户也需显式配置) ---
-    local pam_files=("common-session" "common-session-noninteractive" "sshd" "su" "login")
-    local pam_fixed=0
-    for pf in "${pam_files[@]}"; do
-        if [[ -f "/etc/pam.d/$pf" ]]; then
-            if ! grep -q "pam_limits.so" "/etc/pam.d/$pf" 2>/dev/null; then
-                echo "session required pam_limits.so" >> "/etc/pam.d/$pf"
-                pam_fixed=1
-            fi
-        fi
-    done
-    if [[ "$pam_fixed" -eq 1 ]]; then
-                ok "已在 PAM 配置中添加 pam_limits.so (确保 limits.d 对 root 生效)"
-    fi
-
-    # --- /etc/profile.d 兜底 (非交互 shell / 某些 SSH 配置可能绕过 PAM) ---
-    local profile_ulimit="/etc/profile.d/zzz-tcp-tune-ulimit.sh"
-    cat > "$profile_ulimit" <<PROFEOF
-# TCP 调优: 确保文件描述符限制 (兜底，针对绕过 PAM 的 session)
-ulimit -n ${nofile_limit} 2>/dev/null || true
-ulimit -u ${nofile_limit} 2>/dev/null || true
-PROFEOF
-    chmod +x "$profile_ulimit"
-    ok "已写入 profile.d 兜底: $profile_ulimit"
-
-    # --- SSH UsePAM 检查 (无 PAM 则 limits.d 完全不生效) ---
-    if [[ -f /etc/ssh/sshd_config ]]; then
-        if ! grep -q "^UsePAM yes" /etc/ssh/sshd_config 2>/dev/null; then
-            if grep -q "^#UsePAM" /etc/ssh/sshd_config 2>/dev/null; then
-                sed -i 's/^#UsePAM.*/UsePAM yes/' /etc/ssh/sshd_config
-            elif grep -q "^UsePAM" /etc/ssh/sshd_config 2>/dev/null; then
-                sed -i 's/^UsePAM.*/UsePAM yes/' /etc/ssh/sshd_config
-            else
-                echo "UsePAM yes" >> /etc/ssh/sshd_config
-            fi
-            ok "已在 sshd_config 中启用 UsePAM yes (limits.d 依赖 PAM)"
-        fi
-    fi
+    info "参数计算完成，尚未写入任何系统配置文件。"
 }
 
 # ============================================================
@@ -592,6 +469,9 @@ apply_config() {
     # 2. 扫除冲突配置: 禁用所有非 fq 的 qdisc + 非 bbr 的拥塞控制
     # The generated zzz sysctl file is loaded last. Preserve unrelated system configuration.
     # Do not rewrite other qdisc or congestion-control files here; rollback remains straightforward.
+
+    # 写入调优配置（仅在用户选择应用后执行）
+    write_config
 
     if sysctl --system 2>&1 | grep -qiE "error|unknown|invalid"; then
         warn "sysctl --system 可能存在部分错误，请查看上方输出。"
@@ -826,6 +706,170 @@ verify_applied() {
 }
 
 # ============================================================
+# 步骤 7: 写入配置文件
+# ============================================================
+write_config() {
+    step "写入调优配置文件"
+    # --- 写入 sysctl 配置 (zzz- 确保字典序最后加载，覆盖其他默认值) ---
+    local conf_file="/etc/sysctl.d/zzz-tcp-tune.conf"
+
+    cat > "$conf_file" <<SYSCTLEOF
+# ============================================================
+# TCP 深度调优配置
+# 生成时间: $(date '+%Y-%m-%d %H:%M:%S')
+# VPS 配置: ${CPU_CORES}核 / ${RAM_GB_CEIL}G 内存 / ${BANDWIDTH_MBPS}Mbps 带宽
+# Root filesystem: ${DISK_TOTAL_GB}G total / ${DISK_FREE_GB}G available / ${DISK_USED_PCT}% used
+# 延迟基准: ${CHOSEN_IP_STACK} ${CHOSEN_LATENCY_MS}ms
+# ============================================================
+
+# === 核心拥塞控制 (BBR + ${QDISC}) ===
+net.core.default_qdisc = ${QDISC}
+net.ipv4.tcp_congestion_control = ${cc_algo}
+
+# === 流量队列与积压 (适配 ${RAM_GB_CEIL}G 内存) ===
+net.core.somaxconn = ${somaxconn}
+net.ipv4.tcp_max_syn_backlog = ${tcp_max_syn_backlog}
+net.core.netdev_max_backlog = ${netdev_max_backlog}
+
+    # High-concurrency proxy connection management.
+net.ipv4.ip_local_port_range = 1024 65535
+net.ipv4.tcp_syncookies = 1
+net.ipv4.tcp_synack_retries = 3
+net.ipv4.tcp_moderate_rcvbuf = 1
+net.ipv4.tcp_notsent_lowat = ${tcp_notsent_lowat}
+
+# === System protection baseline ===
+# Reboot 10 seconds after a kernel panic.
+kernel.panic = 10
+# Minimize swap preference; this does not disable swap.
+vm.swappiness = 1
+# Enable heuristic memory overcommit; continue monitoring for OOM.
+vm.overcommit_memory = 1
+
+# === 缓冲区: 动态上限 (基于 BDP, 上限 ${buf_max_mb}MB) ===
+# BDP = ${BANDWIDTH_MBPS}Mbps × ${CHOSEN_LATENCY_MS}ms = $(awk -v b="$bdp_bytes" 'BEGIN{printf "%.2f", b/1024/1024}')MB
+net.core.rmem_max = ${buf_max}
+net.core.wmem_max = ${buf_max}
+net.ipv4.tcp_rmem = 4096 ${tcp_rmem_default} ${buf_max}
+net.ipv4.tcp_wmem = 4096 ${tcp_wmem_default} ${buf_max}
+
+# === 内存压榨策略 (适配 ${RAM_GB_CEIL}G) ===
+
+# === 协议栈基础与代理进阶优化 ===
+net.ipv4.tcp_sack = 1
+net.ipv4.tcp_timestamps = 1
+net.ipv4.tcp_window_scaling = 1
+net.ipv4.tcp_tw_reuse = 1
+net.ipv4.tcp_fin_timeout = ${tcp_fin_timeout}
+net.ipv4.tcp_slow_start_after_idle = ${tcp_slow_start_after_idle}
+
+# TCP Fast Open (降低握手延迟)
+net.ipv4.tcp_fastopen = ${tcp_fastopen}
+
+# MTU 探测 (防止跨国路由黑洞)
+net.ipv4.tcp_mtu_probing = ${tcp_mtu_probing}
+
+# === 连接保持 (防僵尸连接) ===
+net.ipv4.tcp_keepalive_time = ${keepalive_time}
+net.ipv4.tcp_keepalive_intvl = ${keepalive_intvl}
+net.ipv4.tcp_keepalive_probes = ${keepalive_probes}
+
+# === IPv6 调优 (如果使用 IPv6) ===
+
+# === 系统级设置 ===
+fs.file-max = ${file_max}
+
+# === 系统保命机制 ===
+SYSCTLEOF
+
+    ok "已写入 sysctl 配置: $conf_file"
+
+    # --- 写入 limits 配置 ---
+    local limits_file="/etc/security/limits.d/zzz-tcp-tune-limits.conf"
+    cat > "$limits_file" <<LIMITSEOF
+* soft nofile ${nofile_limit}
+* hard nofile ${nofile_limit}
+* soft nproc ${nofile_limit}
+* hard nproc ${nofile_limit}
+LIMITSEOF
+
+    ok "已写入 limits 配置: $limits_file"
+
+    # --- 写入 modules-load.d (开机自动加载必需模块) ---
+    local modload_file="/etc/modules-load.d/tcp-tune.conf"
+    {
+        echo "# TCP 调优必需模块"
+        echo "tcp_bbr"
+        # 只有 fq 作为可加载模块存在时才写入 (内置则不需要)
+        if [[ "$QDISC" == "fq" ]]; then
+            find "/lib/modules/$(uname -r)" -name "sch_fq.ko*" 2>/dev/null | grep -q . && echo "sch_fq"
+        fi
+    } > "$modload_file"
+    ok "已写入模块自动加载: $modload_file"
+
+    # --- Systemd 补丁 ---
+    local sed_fail=0
+    sed -i "/^#*DefaultLimitNOFILE=/c DefaultLimitNOFILE=${nofile_limit}" /etc/systemd/system.conf 2>/dev/null || sed_fail=1
+    sed -i "/^#*DefaultLimitNPROC=/c DefaultLimitNPROC=${nofile_limit}" /etc/systemd/system.conf 2>/dev/null || sed_fail=1
+    if [[ "$sed_fail" -eq 1 ]]; then
+        warn "systemd 资源限制写入失败，请手动检查 /etc/systemd/system.conf。"
+    fi
+
+    ok "已更新 systemd 资源限制。"
+
+    # --- Xray systemd service override ---
+    local xray_dropin_dir="/etc/systemd/system/xray.service.d"
+    mkdir -p "$xray_dropin_dir"
+    cat > "$xray_dropin_dir/99-tcp-tune.conf" <<XRAYEOF
+[Service]
+LimitNOFILE=${nofile_limit}
+LimitNPROC=${nofile_limit}
+TasksMax=infinity
+XRAYEOF
+    ok "Xray systemd override written: $xray_dropin_dir/99-tcp-tune.conf"
+
+
+    # --- 确保 pam_limits.so 被加载 (root 用户也需显式配置) ---
+    local pam_files=("common-session" "common-session-noninteractive" "sshd" "su" "login")
+    local pam_fixed=0
+    for pf in "${pam_files[@]}"; do
+        if [[ -f "/etc/pam.d/$pf" ]]; then
+            if ! grep -q "pam_limits.so" "/etc/pam.d/$pf" 2>/dev/null; then
+                echo "session required pam_limits.so" >> "/etc/pam.d/$pf"
+                pam_fixed=1
+            fi
+        fi
+    done
+    if [[ "$pam_fixed" -eq 1 ]]; then
+                ok "已在 PAM 配置中添加 pam_limits.so (确保 limits.d 对 root 生效)"
+    fi
+
+    # --- /etc/profile.d 兜底 (非交互 shell / 某些 SSH 配置可能绕过 PAM) ---
+    local profile_ulimit="/etc/profile.d/zzz-tcp-tune-ulimit.sh"
+    cat > "$profile_ulimit" <<PROFEOF
+# TCP 调优: 确保文件描述符限制 (兜底，针对绕过 PAM 的 session)
+ulimit -n ${nofile_limit} 2>/dev/null || true
+ulimit -u ${nofile_limit} 2>/dev/null || true
+PROFEOF
+    chmod +x "$profile_ulimit"
+    ok "已写入 profile.d 兜底: $profile_ulimit"
+
+    # --- SSH UsePAM 检查 (无 PAM 则 limits.d 完全不生效) ---
+    if [[ -f /etc/ssh/sshd_config ]]; then
+        if ! grep -q "^UsePAM yes" /etc/ssh/sshd_config 2>/dev/null; then
+            if grep -q "^#UsePAM" /etc/ssh/sshd_config 2>/dev/null; then
+                sed -i 's/^#UsePAM.*/UsePAM yes/' /etc/ssh/sshd_config
+            elif grep -q "^UsePAM" /etc/ssh/sshd_config 2>/dev/null; then
+                sed -i 's/^UsePAM.*/UsePAM yes/' /etc/ssh/sshd_config
+            else
+                echo "UsePAM yes" >> /etc/ssh/sshd_config
+            fi
+            ok "已在 sshd_config 中启用 UsePAM yes (limits.d 依赖 PAM)"
+        fi
+    fi
+}
+
+# ============================================================
 # Choice Menu: 应用 / AI 提示 / 跳过
 # ============================================================
 choice_menu() {
@@ -834,7 +878,7 @@ choice_menu() {
     echo -e "${CYAN}${BOLD}  选择后续操作${NC}"
     echo -e "${CYAN}${BOLD}======================================${NC}"
     echo ""
-    echo "  调优参数已生成并写入配置文件，请选择:"
+    echo "  调优参数已生成，请选择后续操作:"
     echo ""
     echo "    1) 应用设置 + 生成 AI 提示词"
     echo "       - sysctl --system 使参数生效"
@@ -845,11 +889,11 @@ choice_menu() {
     echo "       - 跳过 AI 提示词"
     echo ""
     echo "    3) 仅生成 AI 提示词"
-    echo "       - 配置文件已写入，暂不生效"
+    echo "       - 仅生成 AI 提示词，不写入系统配置"
     echo "       - 生成 AI 提示词到 /root/tcp-tune-ai-prompt.txt"
     echo ""
     echo "    4) 跳过"
-    echo "       - 配置文件已写入，可稍后手动运行 sysctl --system"
+    echo "       - 不写入系统配置，可稍后重跑本脚本"
     echo ""
     while true; do
         read -r -p "  请选择 [1-4]: " action < /dev/tty
@@ -872,7 +916,7 @@ generate_ai_prompt() {
     local ai_prompt_file="/root/tcp-tune-ai-prompt.txt"
     local vps_label="${CPU_CORES}核 ${RAM_GB_CEIL}G ${BANDWIDTH_MBPS}Mbps"
     local bdp_mb_val
-    bdp_mb_val=$(echo "scale=2; ${bdp_bytes:-0}/1024/1024" | bc 2>/dev/null || echo "?")
+    bdp_mb_val=$(awk -v b="${bdp_bytes:-0}" 'BEGIN{printf "%.2f", b/1024/1024}')
 
     cat > "$ai_prompt_file" <<AIEOF
 ## XRAY_CORE_BASELINE
@@ -933,8 +977,8 @@ Before generating changes, collect and record sysctl values, ulimit -n, /proc/me
 - BBR: $($BBRV3_READY && echo "已安装" || echo "未安装")
 
 ## 网络延迟
-- IPv4 到 120.241.152.135: $( [[ $(echo "$LATENCY_IPV4_MS > 0" | bc -l 2>/dev/null) == "1" ]] && echo "${LATENCY_IPV4_MS} ms" || echo "不可达" )
-- IPv6 到 2409:8c54:871:1001::12: $( [[ $(echo "$LATENCY_IPV6_MS > 0" | bc -l 2>/dev/null) == "1" ]] && echo "${LATENCY_IPV6_MS} ms" || echo "不可达" )
+- IPv4 到 120.241.152.135: $( latency_available "$LATENCY_IPV4_MS" && echo "${LATENCY_IPV4_MS} ms" || echo "不可达" )
+- IPv6 到 2409:8c54:871:1001::12: $( latency_available "$LATENCY_IPV6_MS" && echo "${LATENCY_IPV6_MS} ms" || echo "不可达" )
 - 选用基准: ${CHOSEN_IP_STACK} ${CHOSEN_LATENCY_MS}ms
 
 ## 已计算的基准参数
@@ -1144,8 +1188,8 @@ print_summary() {
     echo -e "  ${BOLD}应用配置${NC}"
     echo -e "    CC 算法:   ${CYAN}BBR${NC}"
     echo -e "    QDISC:     ${CYAN}${QDISC}${NC}"
-    echo -e "    BDP:       ${CYAN}$(echo "scale=2; ${bdp_bytes:-0}/1024/1024" | bc 2>/dev/null || echo '?') MB${NC}"
-    echo -e "    缓冲区上限: ${CYAN}$(echo "scale=0; ${buf_max:-0}/1024/1024" | bc 2>/dev/null || echo '?') MB${NC}"
+    echo -e "    BDP:       ${CYAN}$(awk -v b="${bdp_bytes:-0}" 'BEGIN{printf "%.2f", b/1024/1024}') MB${NC}"
+    echo -e "    缓冲区上限: ${CYAN}$(awk -v b="${buf_max:-0}" 'BEGIN{printf "%.0f", b/1024/1024}') MB${NC}"
     echo -e "    文件描述符: ${CYAN}${nofile_limit:-?}${NC}"
     local ul_show
     ul_show=$(ulimit -n 2>/dev/null || echo "?")
@@ -1213,11 +1257,11 @@ main() {
             ;;
         3)  # 仅 AI 提示词
             generate_ai_prompt
-            info "配置文件已写入 /etc/sysctl.d/，需要时请以 root 运行: sysctl --system"
+            info "未写入任何系统配置文件。"
             ;;
         4)  # 跳过
             info "已跳过应用和 AI 提示词生成。"
-            info "配置文件已写入 /etc/sysctl.d/，需要时请以 root 运行: sysctl --system"
+            info "未写入任何系统配置文件。"
             ;;
     esac
 }
