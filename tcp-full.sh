@@ -645,16 +645,29 @@ choose_latency() {
 generate_tuning() {
     # --- BDP 计算 ---
     bdp_bytes=$(awk -v bw="$BANDWIDTH_MBPS" -v lat="$CHOSEN_LATENCY_MS" 'BEGIN{printf "%d", bw*1000000/8*lat/1000}')
-    target_buf=$(( bdp_bytes * 2 ))
+    # 内存分档决定缓冲策略：
+    #   ≤1G：保守，缓冲 = BDP（四舍五入到整 MB）
+    #   ≥2G：激进，缓冲 = BDP × 2
+    if [[ $RAM_GB_CEIL -le 1 ]]; then
+        target_buf=$bdp_bytes
+    else
+        target_buf=$(( bdp_bytes * 2 ))
+    fi
 
-    # Memory cap: 64MB per GB of RAM, hard-capped at 512MB (socket autotuning ceiling only).
-    mem_cap_buf=$(( RAM_GB_CEIL * 64 * 1024 * 1024 ))
+    # 内存侧上限：按实际内存的约 8% 计算，硬上限 512MB
+    mem_cap_buf=$(( RAM_MB * 1024 * 1024 / 12 ))
     hard_cap_buf=$(( 512 * 1024 * 1024 ))
     [[ $mem_cap_buf -gt $hard_cap_buf ]] && mem_cap_buf=$hard_cap_buf
+
     if [[ $target_buf -lt $mem_cap_buf ]]; then buf_max=$target_buf; else buf_max=$mem_cap_buf; fi
     if [[ $buf_max -lt 4194304 ]]; then buf_max=4194304; fi  # 最小 4MB
 
-    buf_max_mb=$(( buf_max / 1024 / 1024 ))
+    # 低内存 VPS 四舍五入到整 MB，更保守
+    if [[ $RAM_GB_CEIL -le 1 ]]; then
+        buf_max=$(( (buf_max + 524288) / 1048576 * 1048576 ))
+    fi
+
+    buf_max_mb=$(awk -v b="$buf_max" 'BEGIN{printf "%.2f", b/1024/1024}')
     info "BDP = $(awk -v b="$bdp_bytes" 'BEGIN{printf "%.2f", b/1024/1024}') MB, 缓冲区上限 = ${buf_max_mb} MB"
 
     # --- 内存分档参数 ---
@@ -1174,7 +1187,6 @@ BW_MBPS=${BANDWIDTH_MBPS}
 #@ 延迟 (ms)
 LATENCY_MS=${CHOSEN_LATENCY_MS}
 
-# ============================================================
 # 以下参数根据上面的 VPS 规格自动计算
 # ============================================================
 
@@ -1187,7 +1199,7 @@ SYN_BACKLOG=${TV[tcp_max_syn_backlog]}
 #@ netdev_max_backlog
 NETDEV_BACKLOG=${TV[netdev_max_backlog]}
 
-#@ 缓冲区上限 (字节), BDP×2 与内存上限取 min
+#@ 缓冲区上限 (字节), ≤1G BDP / ≥2G BDP×2, 内存约8%上限, 硬上限 512MB
 BUF_MAX=${TV[buf_max]}
 
 #@ rmem_max / wmem_max
@@ -1446,6 +1458,13 @@ Before generating changes, collect and record sysctl values, ulimit -n, /proc/me
 - IPv6 到 2409:8c54:871:1001::12: $( latency_available "$LATENCY_IPV6_MS" && echo "${LATENCY_IPV6_MS} ms" || echo "不可达" )
 - 选用延迟基准: ${CHOSEN_IP_STACK} ${CHOSEN_LATENCY_MS}ms
 
+## 小内存精准调优原则（1G VPS 跑满 2Gbps）
+- 计算窗口必须用 BDP 公式，不要靠猜：带宽(Mbps) × RTT(s) / 8
+- 示例：2000Mbps × 0.15s / 8 = 37.5 MB
+- 理论上每个 TCP 连接至少需要 BDP 大小的缓冲才能跑满带宽
+- 缓冲过低（如 30MB）会导致速度腰斩；应锁定在略高于理论值（如 BDP=37.5MB 时取 40MB），既喂饱带宽，又给 1G 内存留足余量、避免 OOM
+- 不要采用 512MB 这类过大的默认缓冲，1G 内存会周期性 OOM
+
 ## 环境补充信息
 - 内核上游: ${SOURCE} ($([[ "$SOURCE" == "xdflight" ]] && echo "XDflight 内核默认编译 qdisc 可能为 fq_codel" || echo "byJoey 内核默认编译 fq"))
 - 当前运行时 qdisc: $(sysctl -n net.core.default_qdisc 2>/dev/null || echo unknown)
@@ -1456,7 +1475,7 @@ Before generating changes, collect and record sysctl values, ulimit -n, /proc/me
 
 ## 已计算的基准参数
 - BDP (带宽延迟积): ${bdp_mb} MB
-- 缓冲区上限: ${buf_max_mb} MB (BDP×2 与内存限制取最小值)
+- 缓冲区上限: ${buf_max_mb} MB (≤1G 保守=BDP并四舍五入，≥2G 激进=BDP×2；内存约8%上限，硬上限 512MB)
 - 当前已应用:
   - somaxconn = ${TV[somaxconn]}
   - tcp_max_syn_backlog = ${TV[tcp_max_syn_backlog]}
