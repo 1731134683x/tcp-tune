@@ -1591,13 +1591,15 @@ generate_ai_prompt() {
     local bdp_mb="${TV[bdp_mb]}"
 
     # ulimit/nofile 参数来源 (nofile_guide 的 y/n 结果)
-    local nofile_note nofile_rule
+    local nofile_note nofile_rule nofile_tpl_val
     if [[ "$NOFILE_MODE" == "script" ]]; then
         nofile_note=" (已由脚本应用，勿修改)"
         nofile_rule="12. nofile/nproc 已由脚本按 ${RAM_GB_CEIL}G 内存档位应用为 ${TV[nofile_limit]}（limits.d + systemd drop-in + profile.d 兜底），请勿修改该值"
+        nofile_tpl_val="${TV[nofile_limit]}"
     else
         nofile_note=" (脚本未应用，交由你建议)"
         nofile_rule="12. nofile/nproc 未由脚本设置：请根据 VPS 内存档位与容器限制给出建议值，写入 limits.d 与 xray systemd drop-in 并说明理由"
+        nofile_tpl_val="[你的建议值]"
     fi
 
     # 按实际内存档位注入对应的调优原则，避免 1G 小内存提示词一刀切套用到所有机器
@@ -1825,15 +1827,16 @@ fs.file-max = [你的建议值]
 EOF
 
 # === 4. 写入 limits 配置 ===
+# nofile/nproc 值: 直接使用下方占位处的值 (脚本已应用时保持不动，未应用时填你的建议值)
 cat > /etc/security/limits.d/99-zzz-custom-limits.conf <<EOF
-root soft nofile [你的建议值]
-root hard nofile [你的建议值]
-root soft nproc [你的建议值]
-root hard nproc [你的建议值]
+root soft nofile ${nofile_tpl_val}
+root hard nofile ${nofile_tpl_val}
+root soft nproc ${nofile_tpl_val}
+root hard nproc ${nofile_tpl_val}
 EOF
 
-sed -i "/^#*DefaultLimitNOFILE=/c DefaultLimitNOFILE=[你的建议值]" /etc/systemd/system.conf 2>/dev/null || echo "[WARN] systemd DefaultLimitNOFILE 写入失败，请手动检查"
-sed -i "/^#*DefaultLimitNPROC=/c DefaultLimitNPROC=[你的建议值]" /etc/systemd/system.conf 2>/dev/null || echo "[WARN] systemd DefaultLimitNPROC 写入失败，请手动检查"
+sed -i "/^#*DefaultLimitNOFILE=/c DefaultLimitNOFILE=${nofile_tpl_val}" /etc/systemd/system.conf 2>/dev/null || echo "[WARN] systemd DefaultLimitNOFILE 写入失败，请手动检查"
+sed -i "/^#*DefaultLimitNPROC=/c DefaultLimitNPROC=${nofile_tpl_val}" /etc/systemd/system.conf 2>/dev/null || echo "[WARN] systemd DefaultLimitNPROC 写入失败，请手动检查"
 systemctl daemon-reexec 2>/dev/null || echo "[WARN] systemctl daemon-reexec 失败"
 
 # === 5. 加载 sysctl 配置 ===
@@ -1899,15 +1902,15 @@ _check "keepalive_time" "\$(sysctl -n net.ipv4.tcp_keepalive_time)" "[你的建�
 _check "fs.file-max" "\$(sysctl -n fs.file-max)" "[你的建议值]"
 # ulimit 验证: 用 hard limit 判断能否达标；当前 shell 的 soft limit 是旧会话、不会自动更新，用它判断会产生假 WARN；xray.service 的实际限制以 systemd drop-in 为准
 _ulimit_hard=\$(ulimit -Hn 2>/dev/null || echo "?")
-if [[ "\$_ulimit_hard" =~ ^[0-9]+$ ]] && [[ "\$_ulimit_hard" -ge [你的建议值] ]]; then
-    echo "  [OK] ulimit -Hn: \$_ulimit_hard (>= [你的建议值])"
+if [[ "\$_ulimit_hard" =~ ^[0-9]+$ ]] && [[ "\$_ulimit_hard" -ge ${nofile_tpl_val} ]]; then
+    echo "  [OK] ulimit -Hn: \$_ulimit_hard (>= ${nofile_tpl_val})"
     ((_pass++))
 else
-    echo "  [WARN] ulimit -Hn: \$_ulimit_hard (期望 >= [你的建议值])；可能是容器/母机限制，重开 SSH 会话再试；xray.service 以 systemd drop-in 为准"
+    echo "  [WARN] ulimit -Hn: \$_ulimit_hard (期望 >= ${nofile_tpl_val})；可能是容器/母机限制，重开 SSH 会话再试；xray.service 以 systemd drop-in 为准"
     ((_fail++))
 fi
 echo "  [INFO] 当前会话 ulimit -n: \$(ulimit -n 2>/dev/null || echo "?") (旧会话未更新属正常，新登录自动生效)"
-echo "  [INFO] xray.service LimitNOFILE: \$(systemctl show xray.service -p LimitNOFILE 2>/dev/null | cut -d= -f2 || echo 未设置) (期望 >= [你的建议值])"
+echo "  [INFO] xray.service LimitNOFILE: \$(systemctl show xray.service -p LimitNOFILE 2>/dev/null | cut -d= -f2 || echo 未设置) (期望 >= ${nofile_tpl_val})"
 echo "  验证: \$((_pass + _fail)) 项, \$_pass 通过, \$_fail 需关注"
 \`\`\`
 
