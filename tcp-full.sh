@@ -1953,6 +1953,9 @@ main() {
     check_root
     check_os
 
+    # ---- 调优前: 环境检测 + 残留文件清理 (最先执行，先清理再调优) ----
+    pre_apply_check
+
     # Phase 1
     phase1_install_kernel
 
@@ -1962,9 +1965,6 @@ main() {
     test_latency
     choose_latency
     generate_tuning
-
-    # ---- 调优前: 环境检测 + 残留文件清理 (先清理再调优) ----
-    pre_apply_check
 
     # ---- Choice menu ----
     choice_menu

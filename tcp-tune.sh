@@ -1431,15 +1431,16 @@ main() {
     echo -e "${NC}"
 
     check_root
+
+    # ---- 调优前: 环境检测 + 残留文件清理 (最先执行，先清理再调优) ----
+    pre_apply_check
+
     detect_os
     check_bbr
     detect_vps_specs
     test_latency
     choose_latency
     generate_tuning
-
-    # ---- 调优前: 环境检测 + 残留文件清理 (先清理再调优) ----
-    pre_apply_check
 
     # ---- Choice menu ----
     choice_menu
