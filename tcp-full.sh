@@ -772,6 +772,7 @@ pre_apply_check() {
     local dir f b size mtime origin found=0
     local -a late_zz=()
     local -a leftover=()
+    local -a other=()
     for dir in /etc/sysctl.d /etc/security/limits.d /etc/modules-load.d; do
         [[ -d "$dir" ]] || continue
         for f in "$dir"/*.conf; do
@@ -784,9 +785,10 @@ pre_apply_check() {
             mtime=$(stat -c%y "$f" 2>/dev/null | cut -d. -f1)
             case "$b" in
                 zzz-tcp-tune.conf|zzz-tcp-tune-limits.conf|tcp-tune.conf) origin="本工具";;
-                zzzz-tcp-custom.conf|99-zzz-custom-limits.conf|99-custom-limits.conf) origin="AI/模板生成"; leftover+=("$f");;
+                zzzz-tcp-custom.conf|99-zzz-custom.conf|99-zzz-custom-limits.conf|99-custom-limits.conf) origin="AI/模板生成"; leftover+=("$f");;
                 zzz-bbrv3.conf) origin="BBRv3 安装器"; leftover+=("$f");;
-                *) origin="其他来源"; leftover+=("$f");;
+                10-console-messages.conf|10-ipv6-privacy.conf|10-kernel-hardening.conf|10-link-restrictions.conf|10-magic-sysrq.conf|10-map-count.conf|10-network-security.conf|10-ptrace.conf|10-zeropage.conf|20-yama.conf|50-default.conf|99-sysctl.conf) origin="系统默认";;
+                *) origin="其他来源"; other+=("$f");;
             esac
             echo "    [${origin}] ${f}  (${size}B, ${mtime})"
             found=$((found+1))
@@ -820,7 +822,7 @@ pre_apply_check() {
     # --- 2.5 残留文件清理 (在写入新配置之前完成) ---
     if [[ ${#leftover[@]} -gt 0 ]]; then
         step "残留文件清理 (调优前)"
-        info "以下 ${#leftover[@]} 个旧调优文件不在本次管理范围内；本工具管理的 zzz-tcp-tune.conf 等无需手动删除，每次运行会覆盖:"
+        info "检测到 ${#leftover[@]} 个 AI/安装器生成的旧调优文件，建议清理（系统默认/其他来源文件未列入，见上表）:"
         local quoted="" f2
         for f2 in "${leftover[@]}"; do
             quoted+=" \"$f2\""
@@ -830,9 +832,9 @@ pre_apply_check() {
         echo "  tar czf /root/tcp-tune-leftover-backup-\$(date +%Y%m%d%H%M%S).tgz${quoted} 2>/dev/null"
         echo "  rm -f${quoted}"
         echo ""
-        # 交互确认: 现在备份并删除，保证新配置写入前残留文件已被清理
+        echo -e "  ${YELLOW}${BOLD}是否现在自动备份并删除以上 ${#leftover[@]} 个残留文件？${NC}${YELLOW}[y/N] (y=自动备份+删除，直接回车=跳过)${NC}"
         local do_clean=""
-        read -r -p "  是否现在自动备份并删除以上残留文件？[y/N]: " do_clean </dev/tty 2>/dev/null || true
+        read -r do_clean </dev/tty 2>/dev/null || read -r do_clean || true
         if [[ "$do_clean" == "y" || "$do_clean" == "Y" ]]; then
             local bak="/root/tcp-tune-leftover-backup-$(date +%Y%m%d%H%M%S).tgz"
             if tar czf "$bak" "${leftover[@]}" 2>/dev/null && tar tzf "$bak" >/dev/null 2>&1; then
@@ -845,6 +847,9 @@ pre_apply_check() {
             info "未清理残留文件，继续；注意字典序靠后的 zz 文件可能覆盖本次调优结果。"
         fi
         echo ""
+    fi
+    if [[ ${#other[@]} -gt 0 ]]; then
+        warn "另有 ${#other[@]} 个【其他来源】调优文件（见上表）未加入清理命令，可能包含系统或应用自带配置，请人工确认后再决定是否删除。"
     fi
 
     # --- 3. 本次将写入/更新的文件地址 ---
