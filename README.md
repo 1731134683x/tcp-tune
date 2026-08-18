@@ -122,16 +122,31 @@ vm.swappiness = 1
 vm.overcommit_memory = 1
 ```
 
+## 调优方式引导 (y/n)
+
+环境检测、参数计算完成后，脚本引导选择调优方式：
+
+```
+是否使用脚本内置参数直接调优？[y/N]:
+```
+
+| 选择 | 行为 |
+|------|------|
+| `y` | 应用脚本内置参数；生成的 AI 提示词为**审查模式**（只审查当前参数、禁止修改，用于让 AI 复核风险） |
+| `n` / 回车 | 不写入系统配置；生成 AI 提示词让 AI **重新计算**个性化调参方案 |
+
 ## AI 提示词
 
-运行 `tcp-full.sh` 调优完成后会询问是否生成 `/root/tcp-ai-prompt.txt`：
+调优完成后生成 `/root/tcp-ai-prompt.txt`（`tcp-tune.sh` 为 `/root/tcp-tune-ai-prompt.txt`），分两种模式：
+
+- **plan 模式**（选 n）：让 AI 根据 VPS 规格重新计算参数并输出可执行 bash 脚本
+- **review 模式**（选 y）：提示词头部有 `OVERRIDE_TASK: REVIEW_MODE`，AI 只审查已应用参数、指出风险与建议方向，不生成修改脚本
 
 ```bash
 # 查看提示词
 cat /root/tcp-ai-prompt.txt
 
 # 复制全文 → 粘贴到 DeepSeek / ChatGPT 等 AI 对话框
-# AI 会根据你的 VPS 规格返回更精细的调参脚本
 ```
 
 提示词中已预填当前 VPS 的完整参数（CPU、内存、带宽、延迟、BDP、全部 sysctl 值），
