@@ -37,6 +37,7 @@ REPO=""
 API_BASE=""
 GIT_HASH=""
 SOURCE_ARCH_TAG=""      # 用于 tag 过滤的架构标识 (byJoey=x86_64, XDflight=amd64)
+NOFILE_MODE="script"    # ulimit/nofile 参数来源: script=脚本内置分档值 / ai=交由 AI 提示词建议
 
 # 命令行参数
 SKIP_KERNEL=false
@@ -909,24 +910,28 @@ apply_config() {
     systemctl daemon-reexec 2>/dev/null || true
 
     # —— limits 生效验证 ——
-    # 当前 shell 是旧会话: soft limit 不会自动更新，hard limit 才是"能否达到"的关键；
-    # xray.service 的实际限制由 systemd drop-in 决定，与 shell 的 ulimit 无关
-    local ulimit_now ulimit_hard
-    ulimit_now=$(ulimit -n 2>/dev/null || echo "?")
-    ulimit_hard=$(ulimit -Hn 2>/dev/null || echo "?")
-    info "当前会话 ulimit -n: ${ulimit_now} (hard: ${ulimit_hard})，期望 >= ${nofile_limit}"
-    if [[ "$ulimit_hard" =~ ^[0-9]+$ && "$ulimit_hard" -lt "$nofile_limit" ]]; then
-        warn "当前会话 hard limit 只有 ${ulimit_hard}，低于期望值：多为容器/母机限制，可重开 SSH 会话再试。"
-        warn "不影响 xray.service：服务的 fd 限制由 systemd drop-in 直接设置，与 shell ulimit 无关。"
-    elif [[ "$ulimit_now" =~ ^[0-9]+$ && "$ulimit_now" -lt "$nofile_limit" ]]; then
-        info "当前会话 soft limit 未更新属正常（旧会话），新 SSH 会话将由 limits.d/profile.d 自动提升。"
+    if [[ "$NOFILE_MODE" == "script" ]]; then
+        # 当前 shell 是旧会话: soft limit 不会自动更新，hard limit 才是"能否达到"的关键；
+        # xray.service 的实际限制由 systemd drop-in 决定，与 shell 的 ulimit 无关
+        local ulimit_now ulimit_hard
+        ulimit_now=$(ulimit -n 2>/dev/null || echo "?")
+        ulimit_hard=$(ulimit -Hn 2>/dev/null || echo "?")
+        info "当前会话 ulimit -n: ${ulimit_now} (hard: ${ulimit_hard})，期望 >= ${nofile_limit}"
+        if [[ "$ulimit_hard" =~ ^[0-9]+$ && "$ulimit_hard" -lt "$nofile_limit" ]]; then
+            warn "当前会话 hard limit 只有 ${ulimit_hard}，低于期望值：多为容器/母机限制，可重开 SSH 会话再试。"
+            warn "不影响 xray.service：服务的 fd 限制由 systemd drop-in 直接设置，与 shell ulimit 无关。"
+        elif [[ "$ulimit_now" =~ ^[0-9]+$ && "$ulimit_now" -lt "$nofile_limit" ]]; then
+            info "当前会话 soft limit 未更新属正常（旧会话），新 SSH 会话将由 limits.d/profile.d 自动提升。"
+        else
+            ok "ulimit -n 已生效: ${ulimit_now}"
+        fi
+        if systemctl show xray.service -p LimitNOFILE >/dev/null 2>&1; then
+            local svc_limit
+            svc_limit=$(systemctl show xray.service -p LimitNOFILE 2>/dev/null | cut -d= -f2)
+            info "xray.service LimitNOFILE: ${svc_limit:-未设置} (期望 >= ${nofile_limit})"
+        fi
     else
-        ok "ulimit -n 已生效: ${ulimit_now}"
-    fi
-    if systemctl show xray.service -p LimitNOFILE >/dev/null 2>&1; then
-        local svc_limit
-        svc_limit=$(systemctl show xray.service -p LimitNOFILE 2>/dev/null | cut -d= -f2)
-        info "xray.service LimitNOFILE: ${svc_limit:-未设置} (期望 >= ${nofile_limit})"
+        info "ulimit/nofile 参数交由 AI 建议，脚本未设置，跳过验证。"
     fi
 
     # 验证
@@ -1081,13 +1086,17 @@ verify_applied() {
     actual=$(sysctl -n fs.file-max 2>/dev/null || echo "?")
     _check "fs.file-max" "$actual" "${TV[file_max]}"
 
-    # --- ulimit (以 hard limit 为准; 旧会话 soft 未更新属正常) ---
-    actual=$(ulimit -Hn 2>/dev/null || echo "?")
-    _check "ulimit -Hn" "$actual" "${TV[nofile_limit]}" "ge"
-    local ul_soft_now
-    ul_soft_now=$(ulimit -n 2>/dev/null || echo "?")
-    if [[ "$ul_soft_now" =~ ^[0-9]+$ && "$ul_soft_now" -lt "${TV[nofile_limit]}" ]]; then
-        info "  当前会话 ulimit -n=${ul_soft_now} 未更新属正常（旧会话），新 SSH 会话自动提升；xray.service 以 drop-in 为准。"
+    # --- ulimit (仅 NOFILE_MODE=script 时验证; 以 hard limit 为准) ---
+    if [[ "$NOFILE_MODE" == "script" ]]; then
+        actual=$(ulimit -Hn 2>/dev/null || echo "?")
+        _check "ulimit -Hn" "$actual" "${TV[nofile_limit]}" "ge"
+        local ul_soft_now
+        ul_soft_now=$(ulimit -n 2>/dev/null || echo "?")
+        if [[ "$ul_soft_now" =~ ^[0-9]+$ && "$ul_soft_now" -lt "${TV[nofile_limit]}" ]]; then
+            info "  当前会话 ulimit -n=${ul_soft_now} 未更新属正常（旧会话），新 SSH 会话自动提升；xray.service 以 drop-in 为准。"
+        fi
+    else
+        info "  ulimit/nofile 未由脚本设置（交由 AI 建议），跳过验证。"
     fi
 
     # --- PAM ---
@@ -1186,7 +1195,8 @@ fs.file-max = ${file_max}
 SYSCTLEOF
     ok "已写入: $conf"
 
-    # --- limits ---
+    # --- limits (NOFILE_MODE=script 时) ---
+    if [[ "$NOFILE_MODE" == "script" ]]; then
     local lf="/etc/security/limits.d/zzz-tcp-tune-limits.conf"
     cat > "$lf" <<LIMITSEOF
 * soft nofile ${nofile_limit}
@@ -1195,6 +1205,9 @@ SYSCTLEOF
 * hard nproc ${nofile_limit}
 LIMITSEOF
     ok "已写入: $lf"
+    else
+    info "ulimit/nofile 参数交由 AI 建议，跳过 limits.d 写入。"
+    fi
 
     # --- modules-load.d ---
     local mf="/etc/modules-load.d/tcp-tune.conf"
@@ -1204,7 +1217,8 @@ LIMITSEOF
     } > "$mf"
     ok "已写入: $mf"
 
-    # --- systemd ---
+    # --- systemd + Xray drop-in (NOFILE_MODE=script 时) ---
+    if [[ "$NOFILE_MODE" == "script" ]]; then
     local sed_fail=0
     sed -i "/^#*DefaultLimitNOFILE=/c DefaultLimitNOFILE=${nofile_limit}" /etc/systemd/system.conf 2>/dev/null || sed_fail=1
     sed -i "/^#*DefaultLimitNPROC=/c DefaultLimitNPROC=${nofile_limit}" /etc/systemd/system.conf 2>/dev/null || sed_fail=1
@@ -1222,9 +1236,11 @@ LimitNPROC=${nofile_limit}
 TasksMax=infinity
 XRAYEOF
     ok "Xray systemd override written: $xray_dropin_dir/99-tcp-tune.conf"
+    fi
 
 
-    # --- 确保 pam_limits.so 被加载 (root 用户也需显式配置) ---
+    # --- 确保 pam_limits.so 被加载 + profile.d 兜底 + UsePAM (NOFILE_MODE=script 时) ---
+    if [[ "$NOFILE_MODE" == "script" ]]; then
     local pam_files=("common-session" "common-session-noninteractive" "sshd" "su" "login")
     local pam_fixed=0
     for pf in "${pam_files[@]}"; do
@@ -1262,32 +1278,61 @@ PROFEOF
             ok "已在 sshd_config 中启用 UsePAM yes (limits.d 依赖 PAM)"
         fi
     fi
+    fi
 }
 
 # ============================================================
-# 调优方式引导: y=内置参数直接调优 / n=交由 AI 提示词
+# ulimit/nofile 参数引导: y=脚本内置分档值 / n=交由 AI 提示词建议
 # ============================================================
-apply_guide() {
+nofile_guide() {
     echo ""
-    echo -e "${CYAN}${BOLD}======== 选择调优方式 ========${NC}"
-    echo ""
-    echo "  调优参数已生成，请选择调优方式:"
-    echo ""
-    echo "    [y] 使用脚本内置参数直接调优 (推荐)"
-    echo "        - 应用内置参数并生效"
-    echo "        - AI 提示词转为「审查模式」: 只审查当前参数，不修改"
-    echo ""
-    echo "    [n] 交由 AI 提示词生成个性化调参方案"
-    echo "        - 不写入系统配置"
-    echo "        - 生成 AI 提示词到 /root/tcp-ai-prompt.txt"
+    echo -e "${CYAN}${BOLD}  ulimit / nofile 参数处理方式${NC}"
+    echo "    [y] 使用脚本内置分档值: ${nofile_limit} (按 ${RAM_GB_CEIL}G 内存档位计算)"
+    echo "    [n] 不由脚本设置，交由 AI 提示词根据 VPS 情况建议"
     echo ""
     local ans=""
     while true; do
-        read -r -p "  是否使用脚本内置参数直接调优？[y/N]: " ans < /dev/tty 2>/dev/null || read -r ans || true
+        read -r -p "  ulimit/nofile 使用脚本内置值？[y/N]: " ans < /dev/tty 2>/dev/null || read -r ans || true
         case "$ans" in
-            y|Y) return 0 ;;
-            n|N|"") return 1 ;;
+            y|Y) NOFILE_MODE="script"; return ;;
+            n|N|"") NOFILE_MODE="ai"; return ;;
             *) warn "请输入 y 或 n (直接回车 = n)" ;;
+        esac
+    done
+}
+
+# ============================================================
+# Choice Menu: 应用 / AI 提示 / 跳过
+# ============================================================
+choice_menu() {
+    echo ""
+    echo -e "${CYAN}${BOLD}======== 选择后续操作 ========${NC}"
+    echo ""
+    echo "  调优参数已生成，请选择后续操作:"
+    echo ""
+    echo "    1) 应用设置 + 生成 AI 提示词"
+    echo "       - sysctl --system 使参数生效"
+    echo "       - 生成 AI 提示词到 /root/tcp-ai-prompt.txt"
+    echo ""
+    echo "    2) 仅应用设置"
+    echo "       - sysctl --system 使参数生效"
+    echo "       - 跳过 AI 提示词"
+    echo ""
+    echo "    3) 仅生成 AI 提示词"
+    echo "       - 仅生成 AI 提示词，不写入系统配置"
+    echo "       - 生成 AI 提示词到 /root/tcp-ai-prompt.txt"
+    echo ""
+    echo "    4) 跳过"
+    echo "       - 不写入系统配置，可稍后重跑本脚本"
+    echo ""
+    while true; do
+        read -r -p "  请选择 [1-4]: " action < /dev/tty
+        case "$action" in
+            1) return 1 ;;
+            2) return 2 ;;
+            3) return 3 ;;
+            4) return 4 ;;
+            *) warn "请输入 1、2、3 或 4" ;;
         esac
     done
 }
@@ -1540,27 +1585,20 @@ TMPLEOF
 
 # 生成 AI 提示词 (用于粘贴到 DeepSeek / ChatGPT 等获取更精细调参)
 generate_ai_prompt() {
-    # 模式: plan=让 AI 生成调参方案 (默认) / review=只审查当前参数、禁止修改
-    local prompt_mode="${1:-plan}"
-    if [[ "$prompt_mode" == "review" ]]; then
-        step "生成 AI 提示词 (审查模式: 只审查不修改)"
-    else
-        step "生成 AI 提示词"
-    fi
-
-    local review_banner=""
-    if [[ "$prompt_mode" == "review" ]]; then
-        review_banner='## OVERRIDE_TASK: REVIEW_MODE
-本提示词处于【审查模式】：忽略下方一切"生成配置/生成脚本/apply"类指令。
-唯一任务：审查「已计算的基准参数」是否合理，输出意见与风险提示；不得生成 bash 脚本、不得建议修改任何参数值。
-
-'
-    fi
-
     local ai_prompt_file="/root/tcp-ai-prompt.txt"
     local vps_label="${CPU_CORES}核 ${RAM_GB_CEIL}G ${BANDWIDTH_MBPS}Mbps"
     local buf_max_mb="${TV[buf_max_mb]}"
     local bdp_mb="${TV[bdp_mb]}"
+
+    # ulimit/nofile 参数来源 (nofile_guide 的 y/n 结果)
+    local nofile_note nofile_rule
+    if [[ "$NOFILE_MODE" == "script" ]]; then
+        nofile_note=" (已由脚本应用，勿修改)"
+        nofile_rule="12. nofile/nproc 已由脚本按 ${RAM_GB_CEIL}G 内存档位应用为 ${TV[nofile_limit]}（limits.d + systemd drop-in + profile.d 兜底），请勿修改该值"
+    else
+        nofile_note=" (脚本未应用，交由你建议)"
+        nofile_rule="12. nofile/nproc 未由脚本设置：请根据 VPS 内存档位与容器限制给出建议值，写入 limits.d 与 xray systemd drop-in 并说明理由"
+    fi
 
     # 按实际内存档位注入对应的调优原则，避免 1G 小内存提示词一刀切套用到所有机器
     local mem_policy
@@ -1606,7 +1644,7 @@ generate_ai_prompt() {
     fi
 
     cat > "$ai_prompt_file" <<AIEOF
-${review_banner}## XRAY_CORE_BASELINE
+## XRAY_CORE_BASELINE
 The target is Xray-core. Produce one safe baseline for an Xray service; do not split the answer into Nginx/HAProxy/Docker/Kubernetes or unrelated application profiles.
 - Treat Xray as a high-concurrency user-space proxy with many inbound/outbound TCP sockets, possible UDP relay, and a mixture of persistent and short-lived connections.
 - Do not change forwarding, TProxy, policy routing, nftables/iptables, conntrack, or UDP memory parameters unless the collected runtime facts prove that this Xray host uses those features and is under pressure.
@@ -1708,21 +1746,8 @@ ${mem_policy}
   - tcp_keepalive_intvl = ${TV[keepalive_intvl]}
   - tcp_keepalive_probes = ${TV[keepalive_probes]}
   - fs.file-max = ${TV[file_max]}
-  - nofile / nproc 限制 = ${TV[nofile_limit]}
-AIEOF
+  - nofile / nproc 限制 = ${TV[nofile_limit]}${nofile_note}
 
-    if [[ "$prompt_mode" == "review" ]]; then
-        cat >> "$ai_prompt_file" <<REVIEWEOF
-## 任务: 配置审查 (勿修改)
-当前 VPS 已应用上方「已计算的基准参数」，请勿重新计算、勿生成修改脚本。
-请逐项审查并输出:
-1. 合理性: 该参数是否适合 ${RAM_GB_CEIL}G 内存 / ${BANDWIDTH_MBPS}Mbps 带宽 / ${CHOSEN_LATENCY_MS}ms 延迟的 Xray 代理场景
-2. 风险点: OOM、缓冲过大或过小、超时/保活与延迟不匹配、队列参数过载等
-3. 改进建议: 如有问题，仅说明调整方向和理由，不要输出可执行脚本
-请直接输出审查结论。
-REVIEWEOF
-    else
-        cat >> "$ai_prompt_file" <<AIEOF2
 ## 输出要求
 请生成一个可直接执行的 bash 脚本，格式参考如下模板。要求:
 1. 根据 ${RAM_GB_CEIL}G 内存和 ${BANDWIDTH_MBPS}Mbps 带宽重新计算最合理的参数
@@ -1736,6 +1761,7 @@ REVIEWEOF
 9. 每个写入操作都需要检测是否失败，失败要输出明确的错误警告
 10. 验证多值参数 (tcp_rmem/tcp_wmem) 时必须先用 tr -s ' \t' ' ' 归一化空白再比较：sysctl -n 的输出以 TAB 分隔，用空格拼期望值会误报 WARN（模板已示范，请照抄）
 11. 验证 ulimit 时用 ulimit -Hn (hard limit) 判断是否达标：当前 shell 的 soft limit 属于旧会话、不会自动更新，用它判断会产生假 WARN；xray.service 的实际限制以 systemctl show xray.service -p LimitNOFILE 和 systemd drop-in 为准（模板已示范，请照抄）
+${nofile_rule}
 10. 脚本末尾必须包含参数验证部分：逐项使用 sysctl -n 回读每个参数值，与期望值比较，不一致的输出 [WARN]
 
 输出格式模板 (将 [] 中的值替换为你的计算结果):
@@ -1886,8 +1912,7 @@ echo "  验证: \$((_pass + _fail)) 项, \$_pass 通过, \$_fail 需关注"
 \`\`\`
 
 请直接输出完整结果。
-AIEOF2
-    fi
+AIEOF
 
     ok "AI 提示词已生成: $ai_prompt_file"
     info "将此文件内容粘贴到 DeepSeek / ChatGPT 等 AI 工具，获取更精细的调参建议。"
@@ -1951,7 +1976,11 @@ print_final_report() {
     echo -e "    缓冲上限:     ${CYAN}${TV[buf_max_mb]} MB${NC}"
     echo -e "    somaxconn:    ${CYAN}${TV[somaxconn]}${NC}"
     echo -e "    SYN backlog:  ${CYAN}${TV[tcp_max_syn_backlog]}${NC}"
-    echo -e "    文件描述符:   ${CYAN}${TV[nofile_limit]}${NC}"
+    if [[ "$NOFILE_MODE" == "script" ]]; then
+        echo -e "    文件描述符:   ${CYAN}${TV[nofile_limit]}${NC} (脚本内置分档值)"
+    else
+        echo -e "    文件描述符:   ${CYAN}未设置${NC} (交由 AI 提示词建议)"
+    fi
     local ul_show
     ul_show=$(ulimit -n 2>/dev/null || echo "?")
     echo -e "    ulimit -n:    ${CYAN}${ul_show}${NC}"
@@ -2022,23 +2051,38 @@ main() {
     choose_latency
     generate_tuning
 
-    # ---- 调优方式引导: y=内置参数直接调优 / n=交由 AI 提示词 ----
-    apply_guide
-    local use_builtin=$?
+    # ---- ulimit/nofile 参数引导: y=脚本内置 / n=交由 AI ----
+    nofile_guide
 
-    if [[ $use_builtin -eq 0 ]]; then
-        # y: 应用脚本内置参数，AI 提示词转为审查模式 (只审查不修改)
-        apply_config
-        generate_custom_template
-        generate_ai_prompt review
-        print_final_report
-    else
-        # n: 不应用，交由 AI 提示词生成个性化调参方案
-        generate_custom_template
-        generate_ai_prompt plan
-        info "未写入任何系统配置文件，请将 AI 返回的脚本审查后执行。"
-        print_final_report
-    fi
+    # ---- Choice menu ----
+    choice_menu
+    local action=$?
+
+    case $action in
+        1)  # 应用设置 + AI 提示词 + 模板
+            apply_config
+            generate_custom_template
+            generate_ai_prompt
+            print_final_report
+            ;;
+        2)  # 仅应用设置 + 模板
+            apply_config
+            generate_custom_template
+            print_final_report
+            ;;
+        3)  # 仅 AI 提示词 + 模板
+            generate_custom_template
+            generate_ai_prompt
+            info "未写入任何系统配置文件。"
+            print_final_report
+            ;;
+        4)  # 跳过
+            generate_custom_template
+            info "已跳过应用和 AI 提示词生成。"
+            info "未写入任何系统配置文件。"
+            print_final_report
+            ;;
+    esac
 }
 
 main "$@"

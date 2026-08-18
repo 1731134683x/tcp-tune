@@ -122,25 +122,24 @@ vm.swappiness = 1
 vm.overcommit_memory = 1
 ```
 
-## 调优方式引导 (y/n)
+## ulimit/nofile 参数引导 (y/n)
 
-环境检测、参数计算完成后，脚本引导选择调优方式：
+参数计算完成后、进入操作菜单（1/2/3/4）之前，脚本询问 **ulimit/nofile 参数**的来源：
 
 ```
-是否使用脚本内置参数直接调优？[y/N]:
+ulimit/nofile 使用脚本内置值？[y/N]:
 ```
 
 | 选择 | 行为 |
 |------|------|
-| `y` | 应用脚本内置参数；生成的 AI 提示词为**审查模式**（只审查当前参数、禁止修改，用于让 AI 复核风险） |
-| `n` / 回车 | 不写入系统配置；生成 AI 提示词让 AI **重新计算**个性化调参方案 |
+| `y` | 使用脚本内置分档值（按内存档位计算），写入 limits.d / systemd drop-in / profile.d 兜底；AI 提示词中标注"已由脚本应用，勿修改" |
+| `n` / 回车 | 脚本不设置该参数（跳过 limits.d、drop-in、profile.d 写入）；AI 提示词中标注"未设置，交由你建议"，由 AI 根据 VPS 内存档位与容器限制给出建议值 |
+
+其余流程与之前完全一致：操作菜单仍为 `1) 应用+AI 提示词 / 2) 仅应用 / 3) 仅 AI 提示词 / 4) 跳过`。
 
 ## AI 提示词
 
-调优完成后生成 `/root/tcp-ai-prompt.txt`（`tcp-tune.sh` 为 `/root/tcp-tune-ai-prompt.txt`），分两种模式：
-
-- **plan 模式**（选 n）：让 AI 根据 VPS 规格重新计算参数并输出可执行 bash 脚本
-- **review 模式**（选 y）：提示词头部有 `OVERRIDE_TASK: REVIEW_MODE`，AI 只审查已应用参数、指出风险与建议方向，不生成修改脚本
+调优完成后生成 `/root/tcp-ai-prompt.txt`（`tcp-tune.sh` 为 `/root/tcp-tune-ai-prompt.txt`）：
 
 ```bash
 # 查看提示词
@@ -151,6 +150,9 @@ cat /root/tcp-ai-prompt.txt
 
 提示词中已预填当前 VPS 的完整参数（CPU、内存、带宽、延迟、BDP、全部 sysctl 值），
 AI 拿到后会给出每项参数的推荐值和选择理由。
+
+提示词中 **ulimit/nofile** 一项会根据上面的 y/n 引导结果注入对应说明：
+选 y 时标注"已由脚本应用，勿修改"，选 n 时标注"未设置，交由你建议"。
 
 提示词会按实际内存档位注入对应的调优原则，不再一刀切套用 1G 小内存规则：
 
