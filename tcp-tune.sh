@@ -464,10 +464,113 @@ generate_tuning() {
 }
 
 # ============================================================
+# 调优前: 检测当前系统环境 + 盘点已有调优文件地址
+# ============================================================
+pre_apply_check() {
+    step "调优前环境检测"
+
+    # --- 1. 当前运行时环境快照 ---
+    local qdisc_now cc_now mem_total mem_avail ulimit_now
+    qdisc_now=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo unknown)
+    cc_now=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo unknown)
+    mem_total=$(awk '/MemTotal/ {printf "%.0f", $2/1024}' /proc/meminfo 2>/dev/null || echo 0)
+    mem_avail=$(awk '/MemAvailable/ {printf "%.0f", $2/1024}' /proc/meminfo 2>/dev/null || echo 0)
+    ulimit_now=$(ulimit -n 2>/dev/null || echo unknown)
+    echo ""
+    echo -e "  ${BOLD}当前运行时环境${NC}"
+    echo "    qdisc:       ${qdisc_now}"
+    echo "    拥塞控制:    ${cc_now}"
+    echo "    rmem_max:    $(sysctl -n net.core.rmem_max 2>/dev/null || echo unknown)"
+    echo "    wmem_max:    $(sysctl -n net.core.wmem_max 2>/dev/null || echo unknown)"
+    echo "    somaxconn:   $(sysctl -n net.core.somaxconn 2>/dev/null || echo unknown)"
+    echo "    ulimit -n:   ${ulimit_now}"
+    echo "    内存:        ${mem_total} MB 总量 / ${mem_avail} MB 可用"
+
+    # --- 2. 盘点已存在的调优文件 (多次调优可能残留多个) ---
+    step "盘点已存在的调优文件"
+    local dir f b size mtime origin found=0
+    local -a late_zz=()
+    local -a leftover=()
+    for dir in /etc/sysctl.d /etc/security/limits.d /etc/modules-load.d; do
+        [[ -d "$dir" ]] || continue
+        for f in "$dir"/*.conf; do
+            [[ -f "$f" ]] || continue
+            if ! grep -qE 'tcp_bbr|sch_fq|nofile|nproc|net\.(core|ipv4)|fs\.file-max|vm\.swappiness|vm\.overcommit_memory|kernel\.panic' "$f" 2>/dev/null; then
+                continue
+            fi
+            b=$(basename "$f")
+            size=$(stat -c%s "$f" 2>/dev/null || echo 0)
+            mtime=$(stat -c%y "$f" 2>/dev/null | cut -d. -f1)
+            case "$b" in
+                zzz-tcp-tune.conf|zzz-tcp-tune-limits.conf|tcp-tune.conf) origin="本工具";;
+                zzzz-tcp-custom.conf|99-zzz-custom-limits.conf|99-custom-limits.conf) origin="AI/模板生成"; leftover+=("$f");;
+                zzz-bbrv3.conf) origin="BBRv3 安装器"; leftover+=("$f");;
+                *) origin="其他来源"; leftover+=("$f");;
+            esac
+            echo "    [${origin}] ${f}  (${size}B, ${mtime})"
+            found=$((found+1))
+            if [[ "$dir" == "/etc/sysctl.d" && "$b" == zz* ]]; then
+                late_zz+=("$f")
+            fi
+        done
+    done
+    if grep -qE '^net\.(core\.default_qdisc|ipv4\.tcp_congestion_control)' /etc/sysctl.conf 2>/dev/null; then
+        echo "    [兜底配置] /etc/sysctl.conf (含 qdisc/cc 兜底行)"
+        found=$((found+1))
+    fi
+    if [[ $found -eq 0 ]]; then
+        info "未发现已存在的调优文件，本次为首次调优。"
+    fi
+    # 多个 zz 前缀 sysctl 文件同时存在 → 字典序最后者生效
+    if [[ ${#late_zz[@]} -gt 1 ]]; then
+        local last_zz
+        last_zz=$(printf '%s\n' "${late_zz[@]}" | sort | tail -n1)
+        warn "检测到 ${#late_zz[@]} 个 zz 前缀 sysctl 文件，同时存在时字典序最后的生效:"
+        printf '%s\n' "${late_zz[@]}" | sort | while IFS= read -r f; do
+            if [[ "$f" == "$last_zz" ]]; then
+                echo "      ${f}  ← 当前生效"
+            else
+                echo "      ${f}"
+            fi
+        done
+        warn "建议清理不再需要的旧文件，避免参数互相覆盖。"
+    fi
+
+    # --- 2.5 残留文件清理命令 (不在本次管理范围内的旧文件) ---
+    if [[ ${#leftover[@]} -gt 0 ]]; then
+        step "残留文件清理命令"
+        info "以下 ${#leftover[@]} 个旧调优文件不在本次管理范围内，可选择性删除；本工具管理的 zzz-tcp-tune.conf 等无需手动删除，每次运行会覆盖:"
+        local quoted="" f2
+        for f2 in "${leftover[@]}"; do
+            quoted+=" \"$f2\""
+        done
+        echo ""
+        echo "  # 可选: 先打包备份再删除"
+        echo "  tar czf /root/tcp-tune-leftover-backup-\$(date +%Y%m%d%H%M%S).tgz${quoted} 2>/dev/null"
+        echo ""
+        echo "  # 删除命令 (复制执行)"
+        echo "  rm -f${quoted}"
+        echo ""
+    fi
+
+    # --- 3. 本次将写入/更新的文件地址 ---
+    step "本次将写入/更新的文件地址"
+    echo "    sysctl:   /etc/sysctl.d/zzz-tcp-tune.conf"
+    echo "    limits:   /etc/security/limits.d/zzz-tcp-tune-limits.conf"
+    echo "    modules:  /etc/modules-load.d/tcp-tune.conf"
+    echo "    systemd:  /etc/systemd/system/xray.service.d/99-tcp-tune.conf"
+    echo "    systemd:  /etc/systemd/system.conf (DefaultLimitNOFILE/NPROC 两行)"
+    echo "    sysctl:   /etc/sysctl.conf (仅 qdisc + cc 两行兜底)"
+    echo ""
+}
+
+# ============================================================
 # Step 7: 应用配置
 # ============================================================
 apply_config() {
     step "Step 7: 应用配置"
+
+    pre_apply_check
 
     # 1. 加载内核模块
     modprobe tcp_bbr 2>/dev/null || true
@@ -560,6 +663,25 @@ apply_config() {
     fi
 
     ok "所有配置已应用！"
+
+    # 本次写入/更新的文件地址 + 追加到调优日志 (多次调优可追溯)
+    ok "本次写入/更新的文件:"
+    echo "      /etc/sysctl.d/zzz-tcp-tune.conf"
+    echo "      /etc/security/limits.d/zzz-tcp-tune-limits.conf"
+    echo "      /etc/modules-load.d/tcp-tune.conf"
+    echo "      /etc/systemd/system/xray.service.d/99-tcp-tune.conf"
+    echo "      /etc/systemd/system.conf"
+    echo "      /etc/sysctl.conf"
+    {
+        echo "==== $(date '+%Y-%m-%d %H:%M:%S') 本次调优写入/更新 ===="
+        echo "  /etc/sysctl.d/zzz-tcp-tune.conf"
+        echo "  /etc/security/limits.d/zzz-tcp-tune-limits.conf"
+        echo "  /etc/modules-load.d/tcp-tune.conf"
+        echo "  /etc/systemd/system/xray.service.d/99-tcp-tune.conf"
+        echo "  /etc/systemd/system.conf"
+        echo "  /etc/sysctl.conf"
+    } >> /root/tcp-tune-file-log.txt 2>/dev/null || true
+    ok "文件地址日志: /root/tcp-tune-file-log.txt"
 
     verify_applied
 }
@@ -927,6 +1049,49 @@ generate_ai_prompt() {
     local bdp_mb_val
     bdp_mb_val=$(awk -v b="${bdp_bytes:-0}" 'BEGIN{printf "%.2f", b/1024/1024}')
 
+    # 按实际内存档位注入对应的调优原则，避免 1G 小内存提示词一刀切套用到所有机器
+    local mem_policy
+    if [[ $RAM_GB_CEIL -le 1 ]]; then
+        mem_policy="## 内存适配调优原则（小内存 ${RAM_GB_CEIL}G：喂饱带宽同时防 OOM）
+- 计算窗口必须用 BDP 公式，不要靠猜：带宽(Mbps) × RTT(s) / 8
+- 示例：2000Mbps × 0.15s / 8 = 37.5 MB
+- 理论上每个 TCP 连接至少需要 BDP 大小的缓冲才能跑满带宽
+- 缓冲过低（如 30MB）会导致速度腰斩；应锁定在略高于理论值（如 BDP=37.5MB 时取 40MB），既喂饱带宽，又给小内存留足余量、避免 OOM
+- tcp_rmem/tcp_wmem 的 default 应根据 BDP 动态计算，优先保证短连接和多线程起步速度
+- 只有检测到 socket memory pressure 或 OOM 风险时才降低 default，不要因为内存小就先把 default 降到 2MiB
+- 目标场景是 Xray 代理，应优先低重传，避免因缓冲、队列或拥塞窗口设置不当引发不必要重传
+- 不要采用 512MB 这类过大的默认缓冲，小内存会周期性 OOM"
+    elif [[ $RAM_GB_CEIL -eq 2 ]]; then
+        mem_policy="## 内存适配调优原则（2G 档：缓冲转激进，预算要算账）
+- 2G 内存允许进入激进档：rmem_max/wmem_max 目标 = BDP×2，仍受内存约 8% 上限（约 160MB）约束
+- 预算账本：估算并发连接数 × tcp_rmem default 的总占用，不要让缓冲吃掉超过内存的约 8%，否则大流量下仍会 OOM
+- default 起步缓冲按 BDP/4 计算并封顶 2MB，起步快且不冒进；只有实测内存压力时才下调
+- 队列与积压按 2G 档放量：somaxconn / tcp_max_syn_backlog 约 8192，netdev_max_backlog 约 16384
+- 低重传优先：fq/fq_codel + BBR，避免缓冲、队列或拥塞窗口设置不当引发不必要重传
+- 不要无脑把缓冲顶到 512MB 硬上限，2G 内存跑大量并发连接时同样会周期性 OOM"
+    elif [[ $RAM_GB_CEIL -le 4 ]]; then
+        mem_policy="## 内存适配调优原则（${RAM_GB_CEIL}G 档：内存充裕，缓冲放开但留冗余）
+- 内存余量充足：rmem_max/wmem_max = BDP×2，受内存约 8% 上限（约 250~340MB）约束，通常足以覆盖高带宽 × 高延迟的 BDP
+- default 起步缓冲 = BDP/4（约 256KB~2MB 区间），保证短连接和多线程起步速度
+- 队列可按本档放量：somaxconn / tcp_max_syn_backlog 约 16384，netdev_max_backlog 约 32768
+- 若实测出现 orphan socket 堆积或 UDP/QUIC 压力，可评估 tcp_max_orphans、udp_mem 等 CONDITIONAL 参数，必须给出测量依据
+- 低重传优先，维持稳定吞吐；不要把内存余量浪费在无意义的巨型缓冲上"
+    elif [[ $RAM_GB_CEIL -le 8 ]]; then
+        mem_policy="## 内存适配调优原则（${RAM_GB_CEIL}G 档：内存不再是瓶颈，硬上限与高并发是主题）
+- 缓冲以 BDP×2 为基准，唯一硬约束是 512MB：高带宽（如 10Gbps）× 高 RTT 时 BDP 可达数百 MB，此时 rmem_max/wmem_max 顶到 512MB 附近
+- default 起步缓冲仍建议 BDP/4 封顶 2MB，防止单连接起步就吞掉大块内存
+- 队列/积压按大内存档：somaxconn 约 32768、netdev_max_backlog 约 65536，file-max/nofile 相应放量
+- 高并发场景优先保证连接建立成功率与低重传，而不是继续堆缓冲
+- 若高 PPS：评估 netdev_budget / netdev_budget_usecs 与 softirq 分布，给出 CPU 成本说明后再调整"
+    else
+        mem_policy="## 内存适配调优原则（${RAM_GB_CEIL}G 档：内存充裕，512MB 是唯一缓冲上限）
+- 缓冲策略：rmem_max/wmem_max = min(BDP×2, 512MB)；内存约 8% 上限在本档通常不再生效
+- 队列/积压可满配：somaxconn / tcp_max_syn_backlog 65535、netdev_max_backlog 65536、nofile 1048576 级别
+- default 起步缓冲按 BDP/4 计算（256KB~2MB），既快又避免单连接异常膨胀
+- 大内存下可考虑提高 tcp_max_orphans、放宽孤儿 socket 回收，但仅限实测确认压力后
+- 优先低重传与连接建立成功率；缓冲已不是瓶颈，别为了「看起来更大」而堆无意义的大值"
+    fi
+
     cat > "$ai_prompt_file" <<AIEOF
 ## XRAY_CORE_BASELINE
 The target is Xray-core. Produce one safe baseline for an Xray service; do not split the answer into Nginx/HAProxy/Docker/Kubernetes or unrelated application profiles.
@@ -947,7 +1112,7 @@ Do not remove or substitute these values without an explicit user request.
 ## TCP_BUFFER_STARTUP_POLICY
 Do not be overly conservative with TCP socket buffers.
 Calculate tcp_rmem/tcp_wmem from BDP, use a startup default large enough for fast ramp-up,
-and keep max at least BDP rounded up.
+and keep max at least BDP rounded up (target BDP×2 when RAM ≥ 2G).
 Do not artificially cap default to 2MiB/4MiB just because the VPS has 1GB RAM;
 only reduce it on measured memory pressure or OOM risk.
 
@@ -1000,15 +1165,7 @@ Before generating changes, collect and record sysctl values, ulimit -n, /proc/me
 - IPv6 到 2409:8c54:871:1001::12: $( latency_available "$LATENCY_IPV6_MS" && echo "${LATENCY_IPV6_MS} ms" || echo "不可达" )
 - 选用基准: ${CHOSEN_IP_STACK} ${CHOSEN_LATENCY_MS}ms
 
-## 小内存精准调优原则（1G VPS 跑满 2Gbps）
-- 计算窗口必须用 BDP 公式，不要靠猜：带宽(Mbps) × RTT(s) / 8
-- 示例：2000Mbps × 0.15s / 8 = 37.5 MB
-- 理论上每个 TCP 连接至少需要 BDP 大小的缓冲才能跑满带宽
-- 缓冲过低（如 30MB）会导致速度腰斩；应锁定在略高于理论值（如 BDP=37.5MB 时取 40MB），既喂饱带宽，又给 1G 内存留足余量、避免 OOM
-- tcp_rmem/tcp_wmem 的 default 应根据 BDP 动态计算，优先保证短连接和多线程起步速度
-- 只有检测到 socket memory pressure 或 OOM 风险时才降低 default，不要因为 1G 内存就先把 default 降到 2MiB
-- 目标场景是 Xray 代理，应优先低重传，避免因缓冲、队列或拥塞窗口设置不当引发不必要重传
-- 不要采用 512MB 这类过大的默认缓冲，1G 内存会周期性 OOM
+${mem_policy}
 
 ## 已计算的基准参数
 - BDP: ${bdp_mb_val} MB
