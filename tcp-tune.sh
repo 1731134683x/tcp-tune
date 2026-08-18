@@ -536,20 +536,33 @@ pre_apply_check() {
         warn "建议清理不再需要的旧文件，避免参数互相覆盖。"
     fi
 
-    # --- 2.5 残留文件清理命令 (不在本次管理范围内的旧文件) ---
+    # --- 2.5 残留文件清理 (在写入新配置之前完成) ---
     if [[ ${#leftover[@]} -gt 0 ]]; then
-        step "残留文件清理命令"
-        info "以下 ${#leftover[@]} 个旧调优文件不在本次管理范围内，可选择性删除；本工具管理的 zzz-tcp-tune.conf 等无需手动删除，每次运行会覆盖:"
+        step "残留文件清理 (调优前)"
+        info "以下 ${#leftover[@]} 个旧调优文件不在本次管理范围内；本工具管理的 zzz-tcp-tune.conf 等无需手动删除，每次运行会覆盖:"
         local quoted="" f2
         for f2 in "${leftover[@]}"; do
             quoted+=" \"$f2\""
         done
         echo ""
-        echo "  # 可选: 先打包备份再删除"
+        echo "  # 手动清理方式 (可选): 先备份再删除"
         echo "  tar czf /root/tcp-tune-leftover-backup-\$(date +%Y%m%d%H%M%S).tgz${quoted} 2>/dev/null"
-        echo ""
-        echo "  # 删除命令 (复制执行)"
         echo "  rm -f${quoted}"
+        echo ""
+        # 交互确认: 现在备份并删除，保证新配置写入前残留文件已被清理
+        local do_clean=""
+        read -r -p "  是否现在自动备份并删除以上残留文件？[y/N]: " do_clean </dev/tty 2>/dev/null || true
+        if [[ "$do_clean" == "y" || "$do_clean" == "Y" ]]; then
+            local bak="/root/tcp-tune-leftover-backup-$(date +%Y%m%d%H%M%S).tgz"
+            if tar czf "$bak" "${leftover[@]}" 2>/dev/null && tar tzf "$bak" >/dev/null 2>&1; then
+                rm -f "${leftover[@]}" || warn "部分文件删除失败。"
+                ok "已备份到 ${bak} 并删除 ${#leftover[@]} 个残留文件。"
+            else
+                warn "备份未成功，未执行删除，请手动处理。"
+            fi
+        else
+            info "未清理残留文件，继续；注意字典序靠后的 zz 文件可能覆盖本次调优结果。"
+        fi
         echo ""
     fi
 
@@ -569,8 +582,6 @@ pre_apply_check() {
 # ============================================================
 apply_config() {
     step "Step 7: 应用配置"
-
-    pre_apply_check
 
     # 1. 加载内核模块
     modprobe tcp_bbr 2>/dev/null || true
@@ -1426,6 +1437,9 @@ main() {
     test_latency
     choose_latency
     generate_tuning
+
+    # ---- 调优前: 环境检测 + 残留文件清理 (先清理再调优) ----
+    pre_apply_check
 
     # ---- Choice menu ----
     choice_menu
