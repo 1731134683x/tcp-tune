@@ -547,21 +547,15 @@ pre_apply_check() {
             quoted+=" \"$f2\""
         done
         echo ""
-        echo "  # 手动清理方式 (可选): 先备份再删除"
-        echo "  tar czf /root/tcp-tune-leftover-backup-\$(date +%Y%m%d%H%M%S).tgz${quoted} 2>/dev/null"
+        echo "  # 手动清理方式: 直接删除"
         echo "  rm -f${quoted}"
         echo ""
-        echo -e "  ${YELLOW}${BOLD}是否现在自动备份并删除以上 ${#leftover[@]} 个残留文件？${NC}${YELLOW}[y/N] (y=自动备份+删除，直接回车=跳过)${NC}"
+        echo -e "  ${YELLOW}${BOLD}是否现在删除以上 ${#leftover[@]} 个残留文件？${NC}${YELLOW}[y/N] (y=直接删除，直接回车=跳过)${NC}"
         local do_clean=""
         read -r do_clean </dev/tty 2>/dev/null || read -r do_clean || true
         if [[ "$do_clean" == "y" || "$do_clean" == "Y" ]]; then
-            local bak="/root/tcp-tune-leftover-backup-$(date +%Y%m%d%H%M%S).tgz"
-            if tar czf "$bak" "${leftover[@]}" 2>/dev/null && tar tzf "$bak" >/dev/null 2>&1; then
-                rm -f "${leftover[@]}" || warn "部分文件删除失败。"
-                ok "已备份到 ${bak} 并删除 ${#leftover[@]} 个残留文件。"
-            else
-                warn "备份未成功，未执行删除，请手动处理。"
-            fi
+            rm -f "${leftover[@]}" || warn "部分文件删除失败。"
+            ok "已删除 ${#leftover[@]} 个残留文件。"
         else
             info "未清理残留文件，继续；注意字典序靠后的 zz 文件可能覆盖本次调优结果。"
         fi
